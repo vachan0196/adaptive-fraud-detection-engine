@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data & models
+data/
+datasets/
+models/
+checkpoints/
+*.pkl
+*.pt
+*.h5
+*.sav
+*.joblib
+*.csv
+*.parquet
+
+# Environment
+venv/
+env/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db

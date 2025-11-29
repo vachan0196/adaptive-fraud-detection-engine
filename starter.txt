@@ -1,0 +1,3 @@
+uvicorn service:app --reload --port 8000
+python simulator_pro.py
+streamlit run app.py

@@ -1,0 +1,16 @@
+pandas
+numpy
+scikit-learn
+xgboost
+lightgbm
+matplotlib
+shap
+streamlit
+joblib
+pyarrow
+fastapi
+uvicorn
+requests
+streamlit-autorefresh
+streamlit-option-menu
+plotly

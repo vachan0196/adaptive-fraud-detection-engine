@@ -1,0 +1,29 @@
+{
+  "active_model": "random_forest",
+  "models": {
+    "random_forest": {
+      "path": "rf_model.pkl",
+      "best_threshold": 0.0251,
+      "expected_cost": 387,
+      "auc": 0.9999991247605223,
+      "confusion_matrix": {
+        "tn": 56676,
+        "fp": 187,
+        "fn": 2,
+        "tp": 56861
+      }
+    },
+    "lightgbm": {
+      "path": "lgbm_model.pkl",
+      "best_threshold": 0.0024000000000000002,
+      "expected_cost": 1312,
+      "auc": 0.9999950937105748,
+      "confusion_matrix": {
+        "tn": 56851,
+        "fp": 12,
+        "fn": 13,
+        "tp": 56850
+      }
+    }
+  }
+}
