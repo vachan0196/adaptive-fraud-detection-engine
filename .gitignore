@@ -1,28 +1,22 @@
-# Python
-__pycache__/
-*.pyc
-
-# Notebooks
-.ipynb_checkpoints/
-
-# Data & models
+# Data & models (ignore raw data, but keep artifacts)
 data/
 datasets/
 models/
 checkpoints/
-*.pkl
+data_raw/
+
+# Ignore large file types globally...
 *.pt
 *.h5
 *.sav
 *.joblib
 *.csv
 *.parquet
+*.pkl
 
-# Environment
-venv/
-env/
-.venv/
-
-# OS files
-.DS_Store
-Thumbs.db
+# ...BUT keep all artifacts tracked
+!artifacts/
+!artifacts/*.pkl
+!artifacts/*.csv
+!artifacts/*.parquet
+!artifacts/*.json
