@@ -19,7 +19,6 @@ COPY . .
 
 # (Optional but recommended) – build artifacts inside the image
 # Comment this out if you prefer to bake artifacts locally instead.
-RUN python train_and_export.py
 
 # Expose ports:
 EXPOSE 8000
