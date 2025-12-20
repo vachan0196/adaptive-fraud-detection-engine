@@ -37,51 +37,86 @@ MAX_LIVE_ROWS = 200_000   # hard cap for live_events
 MAX_CASE_ROWS = 200_000   # hard cap for cases / audit
 
 
+
 # ---------- utils ----------
-@st.cache_resource
 def load_artifacts() -> Tuple[object, list, dict, dict, pd.DataFrame | None, dict | None]:
     """
-    Load:
-      - Active model (RF or LightGBM) using model_meta.json if available.
-      - Feature list, metadata, threshold config, sample data.
-      - Model metadata dictionary (for display).
-    Falls back to rf_model.pkl if model_meta.json is missing or invalid.
-    """
-    # common artifacts
-    features = json.loads(Path(FEATS_PATH).read_text())
-    meta = json.loads(Path(META_PATH).read_text())
-    thr = json.loads(Path(THRESH_PATH).read_text())
-    samples = pd.read_parquet(SAMPLES_PATH) if SAMPLES_PATH.exists() else None
+    Super-defensive loader used inside Streamlit.
 
-    model_meta = None
-    model = None
+    We intentionally removed the @st.cache_resource decorator because in
+    some runs Streamlit was hanging on “Running load_artifacts()”.
+    This version does the same work but:
+      - gives clear error messages if something is missing/corrupted
+      - falls back safely when model_meta.json is broken.
+    """
+    # ---- features / meta / threshold ----
+    try:
+        features = json.loads(FEATS_PATH.read_text())
+    except Exception as e:
+        st.error(f"Failed to read {FEATS_PATH}: {e}")
+        st.stop()
+
+    try:
+        meta = json.loads(META_PATH.read_text())
+    except Exception as e:
+        st.error(f"Failed to read {META_PATH}: {e}")
+        st.stop()
+
+    try:
+        thr = json.loads(THRESH_PATH.read_text())
+    except Exception as e:
+        st.error(f"Failed to read {THRESH_PATH}: {e}")
+        st.stop()
+
+    # ---- optional samples ----
+    samples: pd.DataFrame | None = None
+    if SAMPLES_PATH.exists():
+        try:
+            samples = pd.read_parquet(SAMPLES_PATH)
+        except Exception as e:
+            st.warning(f"Could not read {SAMPLES_PATH}: {e}")
+
+    # ---- model & model_meta ----
+    model_meta: dict | None = None
+    model_path = MODEL_PATH  # default RF model
 
     if MODEL_META_PATH.exists():
         try:
             model_meta = json.loads(MODEL_META_PATH.read_text())
             active_key = model_meta.get("active_model")
             models_info = model_meta.get("models", {}) or {}
-            active_info = models_info.get(active_key, {})
+            active_info = models_info.get(active_key, {}) if active_key else {}
 
-            # e.g. "rf_model.pkl" or "lgbm_model.pkl"
-            rel_path = active_info.get("path", "rf_model.pkl")
-            model_path = ART_DIR / rel_path
-            if not model_path.exists():
-                # fallback to legacy RF if path missing
-                model_path = MODEL_PATH
-            model = joblib.load(model_path)
-        except Exception:
-            # any issue: fallback to single RF model
-            model_meta = None
-            model = joblib.load(MODEL_PATH)
-    else:
-        # old project version: only RF model
-        model = joblib.load(MODEL_PATH)
+            rel_path = active_info.get("path")
+            if rel_path:
+                candidate = ART_DIR / rel_path
+                if candidate.exists():
+                    model_path = candidate
+        except Exception as e:
+            # if anything goes wrong we just fall back to rf_model.pkl
+            st.warning(
+                f"Ignoring model_meta.json due to error: {e}. "
+                "Falling back to rf_model.pkl."
+            )
+
+    try:
+        model = joblib.load(model_path)
+    except Exception as e:
+        st.error(f"Failed to load model from {model_path}: {e}")
+        st.stop()
 
     return model, features, meta, thr, samples, model_meta
 
 
+# actually load everything once at startup
 rf, feature_cols, meta, thr, samples, model_meta = load_artifacts()
+# --- safety: do not allow identifier leakage in the app layer ---
+if "id" in feature_cols:
+    st.warning(
+        "Identifier column 'id' detected in feature list. "
+        "It will be neutralised at inference time to prevent leakage."
+    )
+
 default_threshold = float(thr.get("threshold", 0.025))
 C_FN, C_FP = int(thr.get("C_FN", 100)), int(thr.get("C_FP", 1))
 
@@ -279,11 +314,17 @@ def append_audit_row(event_id: int, old_status: str, new_status: str,
     df.to_csv(AUDIT_PATH, index=False)
 
 
-def auto_resolve_cases(cases: pd.DataFrame,
-                       threshold: float,
-                       demo_enabled: bool = True) -> pd.DataFrame:
+def auto_resolve_cases(
+    cases: pd.DataFrame,
+    threshold: float,
+    demo_enabled: bool = True
+) -> pd.DataFrame:
     """
     Demo auto-resolution logic to simulate customer responses / fraud backoffice.
+
+    Interpretation:
+      - customer_response = "YES"  -> customer authorised -> LEGIT
+      - customer_response = "NO"   -> customer did NOT authorise -> FRAUD
     """
     if not demo_enabled or cases.empty:
         return cases
@@ -304,43 +345,56 @@ def auto_resolve_cases(cases: pd.DataFrame,
     proba = df_pending["proba"].astype(float).fillna(0.0)
 
     # Rules (tweakable):
-    # - Very high proba (>=0.9) and age >= 2 min  -> CONFIRMED_FRAUD  (auto)
-    # - Borderline (between threshold and 0.3) and age >= 5 min -> CONFIRMED_LEGIT
-    # - Medium (0.3–0.9) and age >= 10 min -> random YES/NO with bias to fraud
-    hi_mask = (proba >= 0.90) & (age_minutes >= 2)
-    low_mask = (proba < threshold) & (age_minutes >= 5)
-    mid_mask = (proba >= threshold) & (proba < 0.90) & (age_minutes >= 10)
+    # - High confidence (>= 0.90) and age >= 2 min -> mostly FRAUD, small % LEGIT (false positives)
+    # - Borderline review band (threshold .. 0.30) and age >= 5 min -> mostly LEGIT
+    # - Medium (0.30 .. 0.90) and age >= 10 min -> mix, biased to fraud
+    hi_mask  = (proba >= 0.90) & (age_minutes >= 2)
+    low_mask = (proba >= threshold) & (proba < 0.30) & (age_minutes >= 5)
+    mid_mask = (proba >= 0.30) & (proba < 0.90) & (age_minutes >= 10)
 
-    # apply decisions
     for idx in df_pending.index:
         eid = int(df_pending.loc[idx, "event_id"])
-        p = proba.loc[idx]
+        p = float(proba.loc[idx])
         ts_str = str(df_pending.loc[idx, "ts"])
         old_status = str(df_pending.loc[idx, "status"])
 
         if hi_mask.loc[idx]:
-            new_status = "CONFIRMED_FRAUD"
-            cust_resp = "NO"
+            # Even very high proba alerts can be false positives in real operations.
+            # Keep this small so it still "feels" like fraud is dominant.
+            # If your proba is often exactly 1.0, this is the only way you'll ever see legit.
+            p_legit = max(0.02, 0.10 * (1.0 - p))  # between ~2% and 10%
+            if np.random.rand() < p_legit:
+                new_status = "CONFIRMED_LEGIT"
+                cust_resp = "YES"
+            else:
+                new_status = "CONFIRMED_FRAUD"
+                cust_resp = "NO"
+
         elif low_mask.loc[idx]:
-            new_status = "CONFIRMED_LEGIT"
-            cust_resp = "YES"
+            # Borderline review cases are more likely to be legit
+            if np.random.rand() < 0.75:
+                new_status = "CONFIRMED_LEGIT"
+                cust_resp = "YES"
+            else:
+                new_status = "CONFIRMED_FRAUD"
+                cust_resp = "NO"
+
         elif mid_mask.loc[idx]:
-            # biased coin: 70% fraud, 30% legit for mid band
-            if np.random.rand() < 0.7:
+            # Medium band: biased coin (fraud heavy but still some legit)
+            if np.random.rand() < 0.70:
                 new_status = "CONFIRMED_FRAUD"
                 cust_resp = "NO"
             else:
                 new_status = "CONFIRMED_LEGIT"
                 cust_resp = "YES"
+
         else:
             continue  # still pending
 
         df.loc[df["event_id"] == eid, "status"] = new_status
         df.loc[df["event_id"] == eid, "customer_response"] = cust_resp
         df.loc[df["event_id"] == eid, "resolution_source"] = "AUTO_DEMO"
-        df.loc[df["event_id"] == eid, "updated_at"] = now.isoformat(
-            timespec="seconds"
-        )
+        df.loc[df["event_id"] == eid, "updated_at"] = now.isoformat(timespec="seconds")
 
         append_audit_row(
             event_id=eid,
@@ -358,25 +412,22 @@ def auto_resolve_cases(cases: pd.DataFrame,
 # ---------- header ----------
 st.title("Adaptive Fraud Detection Engine ▸ Real-Time ML + Auto-Case Resolution")
 
-# Build caption with active model info (if available)
 model_name = "RandomForest (legacy)"
-model_auc = None
 if model_meta:
     active_key = model_meta.get("active_model")
     models_info = model_meta.get("models", {}) or {}
     info = models_info.get(active_key, {})
-    # try a friendly name if present
     model_name = info.get("name") or active_key or model_name
-    auc_val = info.get("auc")
-    if isinstance(auc_val, (int, float)):
-        model_auc = auc_val
 
-caption_parts = [
-    f"Default operating threshold: **{default_threshold:.4f}**",
-    f"Cost ratio: FN = {C_FN}×, FP = {C_FP}×",
-    f"Active model: {model_name}" + (f" (AUC={model_auc:.4f})" if model_auc is not None else ""),
-]
-st.caption("  |  ".join(caption_parts))
+st.caption(
+    "  |  ".join([
+        f"Default operating threshold: **{default_threshold:.4f}**",
+        f"Cost ratio: FN = {C_FN}×, FP = {C_FP}×",
+        f"Active model: {model_name}",
+        "Offline-validated model (cost-optimised)",
+    ])
+)
+
 
 # exact 4-decimal threshold selector
 options = [i / 10000 for i in range(0, 2001)]  # 0.0000 .. 0.2000
@@ -737,6 +788,7 @@ elif selected == "Batch Scoring":
     if file is not None:
         try:
             df_in = pd.read_csv(file)
+            required_cols = [c for c in feature_cols if c != "id"]
             missing = [c for c in feature_cols if c not in df_in.columns]
             extra = [c for c in df_in.columns if c not in feature_cols]
             if missing:
@@ -745,6 +797,9 @@ elif selected == "Batch Scoring":
                 if extra:
                     st.info(f"Ignoring extra columns: {extra}")
                 X = df_in[feature_cols].copy()
+                if "id" in X.columns:
+                     X["id"] = 0.0
+
                 probs = rf.predict_proba(X)[:, 1]
                 preds = (probs >= threshold).astype(int)
 
@@ -896,11 +951,11 @@ else:  # "Single Transaction"
 
         try:
             shap_vals = shap_for_binary(rf, x)
-            contrib = (
-                pd.Series(shap_vals, index=feature_cols)
-                .sort_values(key=np.abs, ascending=False)
-                .head(10)
-            )
+            s = pd.Series(shap_vals, index=feature_cols)
+            if "id" in s.index:
+                s = s.drop("id")
+            contrib = s.sort_values(key=np.abs, ascending=False).head(10)
+
 
             st.write("Top factors influencing this decision:")
             st.dataframe(

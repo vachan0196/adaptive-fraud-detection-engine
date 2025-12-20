@@ -125,7 +125,16 @@ class Tx(BaseModel):
 def score(tx: Tx):
     # Validate and order features
     try:
-        x = pd.DataFrame([tx.data])[features]
+        payload = dict(tx.data)
+
+        # Backward compatible: if older artifacts still expect "id", neutralize it.
+        if "id" in features:
+            payload["id"] = 0.0
+        else:
+            payload.pop("id", None)
+
+        x = pd.DataFrame([payload])[features]
+
     except Exception:
         raise HTTPException(
             status_code=400,
