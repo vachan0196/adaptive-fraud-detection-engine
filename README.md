@@ -92,8 +92,7 @@ This layer is critical for understanding **system health and workload**, not jus
 ---
 
 ## 🌐 Live Demo
-- **Live Application:** [AWS deployment link]  
-- **Technical Report:** [PDF link]  
+- **Live Application:** [http://16.16.229.170:8501]  
 
 ---
 
