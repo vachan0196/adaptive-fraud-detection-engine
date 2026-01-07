@@ -4,10 +4,13 @@ from pathlib import Path
 from datetime import datetime
 
 import joblib
-import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+# SQLite storage helpers (you must have storage.py in the same folder)
+from storage import init_db, insert_live_event, get_conn
+
 
 # ---------------- Paths & constants ----------------
 ART = Path("artifacts")
@@ -16,10 +19,10 @@ ART.mkdir(parents=True, exist_ok=True)
 MODEL_PATH = ART / "rf_model.pkl"          # fallback
 FEATS_PATH = ART / "feature_cols.json"
 THRESH_PATH = ART / "threshold.json"       # fallback
-MODEL_META_PATH = ART / "model_meta.json"  # NEW
-LOG_PATH = ART / "live_events.csv"
+MODEL_META_PATH = ART / "model_meta.json"  # preferred selector
 
-MAX_EVENTS = 100_000  # keep at most this many events in the log
+MAX_EVENTS = 100_000  # keep at most this many events in the DB table
+
 
 # ---------------- Load features ----------------
 features = json.loads(FEATS_PATH.read_text())
@@ -57,64 +60,48 @@ def _load_model_and_threshold():
         thr = float(thr_conf.get("threshold", 0.025))
     else:
         thr = 0.025
-    print(
-        f"[service] Loaded fallback RF model {MODEL_PATH} with threshold {thr:.6f}"
-    )
+
+    print(f"[service] Loaded fallback RF model {MODEL_PATH} with threshold {thr:.6f}")
     return model, thr
 
 
 model, THRESHOLD = _load_model_and_threshold()
 
-# ---------------- Init live_events.csv & event_id ----------------
-def _init_log_and_counter() -> int:
+
+def _trim_live_events_db():
     """
-    Ensure live_events.csv exists with the new schema and
-    return the next event_id to use.
+    Keep only the most recent MAX_EVENTS rows in SQLite.
+    This is safe and avoids the DB growing forever.
     """
-    if not LOG_PATH.exists():
-        pd.DataFrame(
-            columns=["event_id", "ts", "decision", "proba", "payload"]
-        ).to_csv(LOG_PATH, index=False)
-        return 1
-
     try:
-        df = pd.read_csv(LOG_PATH, usecols=["event_id"])
-        if df.empty:
-            return 1
-        return int(df["event_id"].max()) + 1
-    except Exception:
-        # Old / incompatible file: reset it
-        print("Resetting live_events.csv to new schema.")
-        pd.DataFrame(
-            columns=["event_id", "ts", "decision", "proba", "payload"]
-        ).to_csv(LOG_PATH, index=False)
-        return 1
-
-
-NEXT_EVENT_ID = _init_log_and_counter()
-
-
-def _get_next_event_id() -> int:
-    global NEXT_EVENT_ID
-    eid = NEXT_EVENT_ID
-    NEXT_EVENT_ID += 1
-    return eid
-
-
-def _trim_live_log():
-    """Keep only the most recent MAX_EVENTS rows in live_events.csv."""
-    try:
-        df = pd.read_csv(LOG_PATH)
-        if len(df) > MAX_EVENTS:
-            df = df.tail(MAX_EVENTS)
-            df.to_csv(LOG_PATH, index=False)
+        with get_conn() as conn:
+            # Delete anything older than the last MAX_EVENTS event_ids
+            conn.execute(
+                """
+                DELETE FROM live_events
+                WHERE event_id NOT IN (
+                    SELECT event_id FROM live_events
+                    ORDER BY event_id DESC
+                    LIMIT ?
+                )
+                """,
+                (int(MAX_EVENTS),),
+            )
     except Exception as e:
-        # Non-fatal; log to console
-        print(f"[WARN] Failed to trim live_events.csv: {e}")
+        # Non-fatal
+        print(f"[WARN] Failed to trim live_events table: {e}")
 
 
 # ---------------- FastAPI app ----------------
 app = FastAPI(title="Fraud Scoring Service")
+
+# Ensure DB/tables exist (safe to call on every startup)
+init_db()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 class Tx(BaseModel):
@@ -141,27 +128,23 @@ def score(tx: Tx):
             detail="Payload missing required feature columns",
         )
 
-    # Model prediction (RF or LightGBM, depending on active model)
+    # Model prediction (RF or other, depending on active model)
     proba = float(model.predict_proba(x)[:, 1][0])
     decision = "REVIEW" if proba >= THRESHOLD else "APPROVE"
 
-    # Create log record
-    event_id = _get_next_event_id()
-    rec = {
-        "event_id": event_id,
-        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
-        "decision": decision,
-        "proba": proba,
-        "payload": json.dumps(tx.data),
-    }
+    # Write event atomically to SQLite (no CSV corruption possible)
+    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    event_id = insert_live_event(
+        ts=ts,
+        decision=decision,
+        proba=proba,
+        payload=tx.data,   # store original payload
+    )
 
-    # Append to log
-    pd.DataFrame([rec]).to_csv(LOG_PATH, mode="a", index=False, header=False)
+    # Keep DB size bounded
+    _trim_live_events_db()
 
-    # Enforce rolling window
-    _trim_live_log()
-
-    # Return result (event_id is useful for debugging / joining)
+    # Return result
     return {
         "event_id": event_id,
         "decision": decision,

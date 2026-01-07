@@ -12,9 +12,18 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
+# ---------- SQLite storage ----------
+from storage import init_db, get_conn, insert_audit_row
+
+# Ensure DB & tables exist on app startup
+init_db()
 
 from streamlit_option_menu import option_menu
 from streamlit_autorefresh import st_autorefresh
+
+
+
+
 
 # ---------- page config ----------
 st.set_page_config(page_title="Fraud Detection — Cost-Optimised", layout="wide")
@@ -33,10 +42,53 @@ LIVE_LOG      = ART_DIR / "live_events.csv"
 CASES_PATH    = ART_DIR / "cases.csv"
 AUDIT_PATH    = ART_DIR / "case_audit_log.csv"
 
-MAX_LIVE_ROWS = 200_000   # hard cap for live_events
+UI_LIVE_READ_CAP = 100_000    # hard cap for live_events
 MAX_CASE_ROWS = 200_000   # hard cap for cases / audit
 
+# ---------- SQLite readers ----------
+def read_live_events(limit: int = UI_LIVE_READ_CAP) -> pd.DataFrame:
+    """
+    Read recent live events from SQLite instead of CSV.
+    Keeps column names identical to the old CSV-based pipeline.
+    """
+    with get_conn() as conn:
+        return pd.read_sql_query(
+            """
+            SELECT
+                event_id,
+                ts,
+                decision,
+                proba,
+                payload_json AS payload
+            FROM live_events
+            ORDER BY event_id DESC
+            LIMIT ?
+            """,
+            conn,
+            params=(int(limit),),
+        )
 
+def read_audit_log(limit: int = 5000) -> pd.DataFrame:
+    """Read recent case audit rows from SQLite (source of truth)."""
+    with get_conn() as conn:
+        return pd.read_sql_query(
+            """
+            SELECT
+                id,
+                event_id,
+                old_status,
+                new_status,
+                source,
+                proba,
+                ts,
+                logged_at
+            FROM case_audit_log
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            conn,
+            params=(int(limit),),
+        )
 
 # ---------- utils ----------
 def load_artifacts() -> Tuple[object, list, dict, dict, pd.DataFrame | None, dict | None]:
@@ -178,25 +230,9 @@ def style_livefeed(df: pd.DataFrame):
 
 
 def ensure_live_log_schema():
-    """Make sure live_events.csv has the columns we expect, including event_id."""
-    if not LIVE_LOG.exists():
-        cols = ["event_id", "ts", "decision", "proba", "payload"]
-        pd.DataFrame(columns=cols).to_csv(LIVE_LOG, index=False)
-        return
-
-    df = pd.read_csv(LIVE_LOG)
-    changed = False
-    if "event_id" not in df.columns:
-        # create a simple incremental event_id if missing
-        df.insert(0, "event_id", range(1, len(df) + 1))
-        changed = True
-    for col in ["ts", "decision", "proba", "payload"]:
-        if col not in df.columns:
-            df[col] = np.nan
-            changed = True
-    if changed:
-        df.to_csv(LIVE_LOG, index=False)
-
+    """SQLite is the source of truth now."""
+    init_db()
+    return
 
 def ensure_cases_schema():
     """Make sure cases.csv exists with event_id as primary reference."""
@@ -230,7 +266,7 @@ def ensure_cases_schema():
 
 def sync_cases_from_live() -> pd.DataFrame:
     """
-    Build / update a simple cases table from live_events.csv.
+    Build / update a simple cases table from SQLite live_events.
     - Every REVIEW transaction becomes / remains a case.
     - New REVIEWs get status=PENDING by default.
     Return merged DataFrame.
@@ -238,11 +274,11 @@ def sync_cases_from_live() -> pd.DataFrame:
     ensure_live_log_schema()
     ensure_cases_schema()
 
-    trim_csv(LIVE_LOG, MAX_LIVE_ROWS, "event_id")
     trim_csv(CASES_PATH, MAX_CASE_ROWS, "event_id")
 
-    live = pd.read_csv(LIVE_LOG)
+    live = read_live_events(UI_LIVE_READ_CAP)
     cases = pd.read_csv(CASES_PATH)
+
 
     if live.empty:
         return cases
@@ -292,26 +328,18 @@ def sync_cases_from_live() -> pd.DataFrame:
 
 def append_audit_row(event_id: int, old_status: str, new_status: str,
                      source: str, proba: float, ts: str):
-    """Append a row to the case audit log CSV."""
-    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    """Append a row to SQLite audit log (atomic)."""
     row = {
-        "event_id": event_id,
-        "ts": ts,
-        "proba": proba,
-        "old_status": old_status,
-        "new_status": new_status,
-        "resolution_source": source,
-        "logged_at": datetime.utcnow().isoformat(timespec="seconds"),
+         "event_id": event_id,
+         "old_status": old_status,
+         "new_status": new_status,
+         "source": source,
+         "proba": float(proba) if proba is not None else None,
+         "ts": ts,
+         "logged_at": datetime.utcnow().isoformat(timespec="seconds"),
     }
-    if AUDIT_PATH.exists():
-        df = pd.read_csv(AUDIT_PATH)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    else:
-        df = pd.DataFrame([row])
-    # trim
-    if len(df) > MAX_CASE_ROWS:
-        df = df.tail(MAX_CASE_ROWS)
-    df.to_csv(AUDIT_PATH, index=False)
+    insert_audit_row(row)
 
 
 def auto_resolve_cases(
@@ -457,46 +485,53 @@ if selected == "Live Feed":
 
     st.subheader("Live Events")
     ensure_live_log_schema()
-    trim_csv(LIVE_LOG, MAX_LIVE_ROWS, "event_id")
 
-    if LIVE_LOG.exists():
-        try:
-            feed = pd.read_csv(LIVE_LOG)
-            if not feed.empty:
-                feed = feed.sort_values("event_id", ascending=False).head(300)
+    try:
+        feed = read_live_events(UI_LIVE_READ_CAP)
 
-                df_disp = feed[["event_id", "ts", "proba", "decision"]].copy()
-                st.table(style_livefeed(df_disp))
+        if not feed.empty:
+            feed = feed.sort_values("event_id", ascending=False).head(300)
 
-                with st.expander("🔎 Inspect payload JSON for a specific row"):
-                    feed["_label"] = (
-                        feed["event_id"].astype(str)
-                        + " | "
-                        + feed["ts"].astype(str)
-                        + " | "
-                        + feed["decision"].astype(str)
-                        + " | "
-                        + (feed["proba"] * 100).round(2).astype(str)
-                        + "%"
-                    )
-                    idx = st.selectbox(
-                        "Select a row",
-                        options=list(feed.index),
-                        format_func=lambda i: feed.loc[i, "_label"],
-                    )
-                    raw = feed.loc[idx, "payload"]
-                    try:
-                        payload_obj = json.loads(raw) if isinstance(raw, str) else raw
-                    except Exception:
-                        payload_obj = {"ERROR": {"message": "src property must be a valid json object"}}
-                    st.json(payload_obj)
-            else:
-                st.info("Waiting for events… start the simulator.")
-        except Exception as e:
-            st.error("Failed to read live log.")
-            st.exception(e)
-    else:
-        st.info("No live events yet. Start the scoring service and simulator.")
+            df_disp = feed[["event_id", "ts", "proba", "decision"]].copy()
+            st.table(style_livefeed(df_disp))
+
+            with st.expander("🔎 Inspect payload JSON for a specific row"):
+                feed["_label"] = (
+                    feed["event_id"].astype(str)
+                    + " | "
+                    + feed["ts"].astype(str)
+                    + " | "
+                    + feed["decision"].astype(str)
+                    + " | "
+                    + (feed["proba"] * 100).round(2).astype(str)
+                    + "%"
+                )
+
+                idx = st.selectbox(
+                    "Select a row",
+                    options=list(feed.index),
+                    format_func=lambda i: feed.loc[i, "_label"],
+                )
+
+                raw = feed.loc[idx, "payload"]
+                try:
+                    payload_obj = json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    payload_obj = {
+                        "ERROR": {
+                            "message": "payload must be a valid JSON object"
+                        }
+                    }
+
+                st.json(payload_obj)
+
+        else:
+            st.info("Waiting for events… start the simulator.")
+
+    except Exception as e:
+        st.error("Failed to read live log.")
+        st.exception(e)
+
 
 # =========================================================
 # ===================== OPS ANALYTICS =====================
@@ -504,264 +539,230 @@ if selected == "Live Feed":
 elif selected == "Ops Analytics":
     st.subheader("Operational Analytics")
     ensure_live_log_schema()
-    trim_csv(LIVE_LOG, MAX_LIVE_ROWS, "event_id")
 
-    if not LIVE_LOG.exists():
-        st.info("No live events yet. Start the scoring service and simulator.")
-    else:
-        try:
-            df = pd.read_csv(LIVE_LOG)
-            if df.empty:
-                st.info("No events to analyse yet.")
-            else:
-                df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-                df = df.dropna(subset=["ts"])
-                df["hour"] = df["ts"].dt.hour
-                df["dow"] = df["ts"].dt.day_name()
-                df["is_review"] = (
-                    df["decision"].astype(str).str.upper() == "REVIEW"
-                ).astype(int)
+    try:
+        df = read_live_events(UI_LIVE_READ_CAP)
 
-                # ---------- Event-level KPIs ----------
-                col1, col2, col3, col4 = st.columns(4)
-                last60 = df[df["ts"] >= df["ts"].max() - pd.Timedelta(minutes=60)]
+        if df.empty:
+            st.info("No events to analyse yet.")
+        else:
+            df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+            df = df.dropna(subset=["ts"])
+            df["hour"] = df["ts"].dt.hour
+            df["dow"] = df["ts"].dt.day_name()
+            df["is_review"] = (df["decision"].astype(str).str.upper() == "REVIEW").astype(int)
 
-                with col1:
-                    st.metric("Tx / min (last 60m)", f"{len(last60) / 60:.1f}")
+            # ---------- Event-level KPIs ----------
+            col1, col2, col3, col4 = st.columns(4)
+            last60 = df[df["ts"] >= df["ts"].max() - pd.Timedelta(minutes=60)]
 
-                with col2:
-                    st.metric("Review rate (overall)", f"{df['is_review'].mean():.1%}")
+            with col1:
+                st.metric("Tx / min (last 60m)", f"{len(last60) / 60:.1f}")
 
-                with col3:
-                    st.metric(
-                        "Avg proba (REVIEW)",
-                        f"{df.loc[df.is_review == 1, 'proba'].mean():.2%}",
-                    )
+            with col2:
+                st.metric("Review rate (overall)", f"{df['is_review'].mean():.1%}")
 
-                with col4:
-                    st.metric(
-                        "p95 proba (REVIEW)",
-                        f"{df.loc[df.is_review == 1, 'proba'].quantile(0.95):.2%}",
-                    )
-
-                # ---------- Case-level KPIs ----------
-                cases = sync_cases_from_live()
-                if not cases.empty:
-                    cases["status"] = cases["status"].astype(str).str.upper()
-                    total_cases = len(cases)
-                    pending_cases = cases[cases["status"] == "PENDING"]
-                    resolved = cases[cases["status"] != "PENDING"]
-                    confirmed_fraud = cases[cases["status"] == "CONFIRMED_FRAUD"]
-                    confirmed_legit = cases[cases["status"] == "CONFIRMED_LEGIT"]
-
-                    resolution_rate = (
-                        len(resolved) / total_cases if total_cases > 0 else 0.0
-                    )
-                    confirmed_fraud_rate = (
-                        len(confirmed_fraud) / len(resolved)
-                        if len(resolved) > 0
-                        else 0.0
-                    )
-                    false_positive_rate = (
-                        len(confirmed_legit) / len(resolved)
-                        if len(resolved) > 0
-                        else 0.0
-                    )
-                    backlog = len(pending_cases)
-
-                    avg_res_minutes = None
-                    if len(resolved) > 0 and "updated_at" in resolved.columns:
-                        try:
-                            ts_dt = pd.to_datetime(resolved["ts"], errors="coerce")
-                            upd_dt = pd.to_datetime(
-                                resolved["updated_at"], errors="coerce"
-                            )
-                            mask = ts_dt.notna() & upd_dt.notna()
-                            if mask.any():
-                                deltas = (
-                                    upd_dt[mask] - ts_dt[mask]
-                                ).dt.total_seconds()
-                                avg_res_minutes = deltas.mean() / 60.0
-                        except Exception:
-                            avg_res_minutes = None
-
-                    c5, c6, c7, c8 = st.columns(4)
-                    with c5:
-                        st.metric("Total cases", total_cases)
-                    with c6:
-                        st.metric("Case resolution rate", f"{resolution_rate:.1%}")
-                    with c7:
-                        st.metric(
-                            "Confirmed fraud rate",
-                            f"{confirmed_fraud_rate:.1%}",
-                        )
-                    with c8:
-                        fp_text = f"{false_positive_rate:.1%}"
-                        if backlog > 0:
-                            fp_text += f"  |  Backlog: {backlog}"
-                        st.metric("False positive rate", fp_text)
-
-                    if avg_res_minutes is not None:
-                        st.caption(
-                            f"Average time to resolution: {avg_res_minutes:.1f} minutes "
-                            f"(for resolved cases with timestamps)."
-                        )
-                    else:
-                        st.caption(
-                            "Average time to resolution: not enough resolved cases with timestamps yet."
-                        )
-                else:
-                    st.info(
-                        "Case queue not initialised yet. Let the simulator run to create some REVIEW transactions."
-                    )
-
-                # ---------- charts ----------
-                c1, c2 = st.columns(2)
-                ts_agg = (
-                    df.set_index("ts")
-                    .resample("1min")["is_review"]
-                    .agg(["count", "mean"])
-                    .fillna(0)
+            with col3:
+                st.metric(
+                    "Avg proba (REVIEW)",
+                    f"{df.loc[df.is_review == 1, 'proba'].mean():.2%}",
                 )
 
-                # Tx per minute (Plotly)
-                with c1:
-                    fig1 = go.Figure()
-                    fig1.add_trace(
-                        go.Scatter(
-                            x=ts_agg.index,
-                            y=ts_agg["count"],
-                            mode="lines",
-                            name="Tx / min",
-                        )
-                    )
-                    fig1.add_trace(
-                        go.Scatter(
-                            x=ts_agg.index,
-                            y=ts_agg["count"]
-                            .rolling(5, min_periods=1)
-                            .mean(),
-                            mode="lines",
-                            name="Rolling avg (5 min)",
-                            line=dict(dash="dash"),
-                        )
-                    )
-                    fig1.update_layout(
-                        title="Transactions per minute (with rolling avg)",
-                        xaxis_title="Time",
-                        yaxis_title="Count",
-                    )
-                    fig1.update_xaxes(tickangle=-30)
-                    st.plotly_chart(fig1, use_container_width=True)
+            with col4:
+                st.metric(
+                    "p95 proba (REVIEW)",
+                    f"{df.loc[df.is_review == 1, 'proba'].quantile(0.95):.2%}",
+                )
 
-                # Review rate per minute (Plotly)
-                with c2:
-                    fig2 = go.Figure()
-                    fig2.add_trace(
-                        go.Scatter(
-                            x=ts_agg.index,
-                            y=ts_agg["mean"],
-                            mode="lines",
-                            name="Review rate / min",
-                        )
+            # ---------- Case-level KPIs ----------
+            cases = sync_cases_from_live()
+            if not cases.empty:
+                cases["status"] = cases["status"].astype(str).str.upper()
+                total_cases = len(cases)
+                pending_cases = cases[cases["status"] == "PENDING"]
+                resolved = cases[cases["status"] != "PENDING"]
+                confirmed_fraud = cases[cases["status"] == "CONFIRMED_FRAUD"]
+                confirmed_legit = cases[cases["status"] == "CONFIRMED_LEGIT"]
+
+                resolution_rate = len(resolved) / total_cases if total_cases > 0 else 0.0
+                confirmed_fraud_rate = len(confirmed_fraud) / len(resolved) if len(resolved) > 0 else 0.0
+                false_positive_rate = len(confirmed_legit) / len(resolved) if len(resolved) > 0 else 0.0
+                backlog = len(pending_cases)
+
+                avg_res_minutes = None
+                if len(resolved) > 0 and "updated_at" in resolved.columns:
+                    try:
+                        ts_dt = pd.to_datetime(resolved["ts"], errors="coerce")
+                        upd_dt = pd.to_datetime(resolved["updated_at"], errors="coerce")
+                        mask = ts_dt.notna() & upd_dt.notna()
+                        if mask.any():
+                            deltas = (upd_dt[mask] - ts_dt[mask]).dt.total_seconds()
+                            avg_res_minutes = deltas.mean() / 60.0
+                    except Exception:
+                        avg_res_minutes = None
+
+                c5, c6, c7, c8 = st.columns(4)
+                with c5:
+                    st.metric("Total cases", total_cases)
+                with c6:
+                    st.metric("Case resolution rate", f"{resolution_rate:.1%}")
+                with c7:
+                    st.metric("Confirmed fraud rate", f"{confirmed_fraud_rate:.1%}")
+                with c8:
+                    fp_text = f"{false_positive_rate:.1%}"
+                    if backlog > 0:
+                        fp_text += f"  |  Backlog: {backlog}"
+                    st.metric("False positive rate", fp_text)
+
+                if avg_res_minutes is not None:
+                    st.caption(
+                        f"Average time to resolution: {avg_res_minutes:.1f} minutes "
+                        f"(for resolved cases with timestamps)."
                     )
-                    fig2.add_trace(
-                        go.Scatter(
-                            x=ts_agg.index,
-                            y=ts_agg["mean"]
-                            .rolling(5, min_periods=1)
-                            .mean(),
-                            mode="lines",
-                            name="Rolling avg (5 min)",
-                            line=dict(dash="dash"),
-                        )
+                else:
+                    st.caption("Average time to resolution: not enough resolved cases with timestamps yet.")
+            else:
+                st.info(
+                    "Case queue not initialised yet. Let the simulator run to create some REVIEW transactions."
+                )
+
+            # ---------- charts ----------
+            c1, c2 = st.columns(2)
+            ts_agg = (
+                df.set_index("ts")
+                .resample("1min")["is_review"]
+                .agg(["count", "mean"])
+                .fillna(0)
+            )
+
+            # Tx per minute (Plotly)
+            with c1:
+                fig1 = go.Figure()
+                fig1.add_trace(
+                    go.Scatter(
+                        x=ts_agg.index,
+                        y=ts_agg["count"],
+                        mode="lines",
+                        name="Tx / min",
                     )
-                    fig2.update_layout(
-                        title="Review rate per minute (with rolling avg)",
-                        xaxis_title="Time",
-                        yaxis_title="Rate",
+                )
+                fig1.add_trace(
+                    go.Scatter(
+                        x=ts_agg.index,
+                        y=ts_agg["count"].rolling(5, min_periods=1).mean(),
+                        mode="lines",
+                        name="Rolling avg (5 min)",
+                        line=dict(dash="dash"),
                     )
-                    fig2.update_xaxes(tickangle=-30)
-                    st.plotly_chart(fig2, use_container_width=True)
+                )
+                fig1.update_layout(
+                    title="Transactions per minute (with rolling avg)",
+                    xaxis_title="Time",
+                    yaxis_title="Count",
+                )
+                fig1.update_xaxes(tickangle=-30)
+                st.plotly_chart(fig1, use_container_width=True)
 
-                c3, c4 = st.columns(2)
-
-                # Distribution of predicted probability (Plotly)
-                with c3:
-                    fig3 = px.histogram(
-                        df,
-                        x="proba",
-                        nbins=30,
-                        title="Distribution of predicted probability",
+            # Review rate per minute (Plotly)
+            with c2:
+                fig2 = go.Figure()
+                fig2.add_trace(
+                    go.Scatter(
+                        x=ts_agg.index,
+                        y=ts_agg["mean"],
+                        mode="lines",
+                        name="Review rate / min",
                     )
-                    fig3.update_layout(
-                        xaxis_title="Probability",
-                        yaxis_title="Frequency",
+                )
+                fig2.add_trace(
+                    go.Scatter(
+                        x=ts_agg.index,
+                        y=ts_agg["mean"].rolling(5, min_periods=1).mean(),
+                        mode="lines",
+                        name="Rolling avg (5 min)",
+                        line=dict(dash="dash"),
                     )
-                    st.plotly_chart(fig3, use_container_width=True)
+                )
+                fig2.update_layout(
+                    title="Review rate per minute (with rolling avg)",
+                    xaxis_title="Time",
+                    yaxis_title="Rate",
+                )
+                fig2.update_xaxes(tickangle=-30)
+                st.plotly_chart(fig2, use_container_width=True)
 
-                # ---------- Heatmap: Review rate by Day × Hour (Plotly) ----------
-                with c4:
-                    pivot = (
-                        df.pivot_table(
-                            index="dow",
-                            columns="hour",
-                            values="is_review",
-                            aggfunc="mean",
-                        )
-                        .reindex(
-                            [
-                                "Monday",
-                                "Tuesday",
-                                "Wednesday",
-                                "Thursday",
-                                "Friday",
-                                "Saturday",
-                                "Sunday",
-                            ]
-                        )
+            c3, c4 = st.columns(2)
+
+            # Distribution of predicted probability (Plotly)
+            with c3:
+                fig3 = px.histogram(
+                    df,
+                    x="proba",
+                    nbins=30,
+                    title="Distribution of predicted probability",
+                )
+                fig3.update_layout(
+                    xaxis_title="Probability",
+                    yaxis_title="Frequency",
+                )
+                st.plotly_chart(fig3, use_container_width=True)
+
+            # ---------- Heatmap: Review rate by Day × Hour (Plotly) ----------
+            with c4:
+                pivot = (
+                    df.pivot_table(
+                        index="dow",
+                        columns="hour",
+                        values="is_review",
+                        aggfunc="mean",
+                    )
+                    .reindex(
+                        [
+                            "Monday",
+                            "Tuesday",
+                            "Wednesday",
+                            "Thursday",
+                            "Friday",
+                            "Saturday",
+                            "Sunday",
+                        ]
+                    )
+                )
+
+                all_hours = list(range(24))
+                pivot = pivot.reindex(columns=all_hours)
+
+                if pivot.isna().all().all():
+                    st.info("Not enough data to build the day × hour heatmap yet.")
+                else:
+                    fig4 = px.imshow(
+                        pivot.values,
+                        x=[str(h) for h in pivot.columns],
+                        y=list(pivot.index),
+                        color_continuous_scale="Plasma",
+                        zmin=0,
+                        zmax=0.30,
+                        labels={"color": "Review rate"},
+                        aspect="auto",
+                    )
+                    fig4.update_layout(
+                        title="Review rate heatmap (Day of week × Hour)",
+                        xaxis_title="Hour of Day",
+                        yaxis_title="Day of Week",
                     )
 
-                    # Ensure we always have columns 0..23, even if some hours missing
-                    all_hours = list(range(24))
-                    pivot = pivot.reindex(columns=all_hours)
+                    text = pivot.applymap(lambda v: f"{v:.0%}" if pd.notna(v) else "").values
+                    fig4.update_traces(
+                        text=text,
+                        texttemplate="%{text}",
+                        textfont_size=9,
+                    )
 
-                    # If there is no data at all, avoid crashing
-                    if pivot.isna().all().all():
-                        st.info(
-                            "Not enough data to build the day × hour heatmap yet."
-                        )
-                    else:
-                        fig4 = px.imshow(
-                            pivot.values,
-                            x=[str(h) for h in pivot.columns],  # 24 labels
-                            y=list(pivot.index),                # 7 labels
-                            color_continuous_scale="Plasma",
-                            zmin=0,
-                            zmax=0.30,
-                            labels={"color": "Review rate"},
-                            aspect="auto",
-                        )
-                        fig4.update_layout(
-                            title="Review rate heatmap (Day of week × Hour)",
-                            xaxis_title="Hour of Day",
-                            yaxis_title="Day of Week",
-                        )
-                        # Annotate cells with percentages
-                        text = pivot.applymap(
-                            lambda v: f"{v:.0%}" if pd.notna(v) else ""
-                        ).values
-                        fig4.update_traces(
-                            text=text,
-                            texttemplate="%{text}",
-                            textfont_size=9,
-                        )
+                    st.plotly_chart(fig4, use_container_width=True)
 
-                        st.plotly_chart(fig4, use_container_width=True)
-
-        except Exception as e:
-            st.error("Failed to compute analytics.")
-            st.exception(e)
+    except Exception as e:
+        st.error("Failed to compute analytics.")
+        st.exception(e)
 
 # =========================================================
 # ===================== BATCH SCORING =====================
@@ -876,14 +877,15 @@ elif selected == "Cases":
 
         # Download audit log
         st.markdown("### Audit log")
-        if AUDIT_PATH.exists():
-            with open(AUDIT_PATH, "rb") as f:
-                st.download_button(
-                    "Download case audit log (CSV)",
-                    data=f,
-                    file_name="case_audit_log.csv",
-                    mime="text/csv",
-                )
+        audit_df = read_audit_log(5000)
+
+        if not audit_df.empty:
+            st.download_button(
+                "Download case audit log (CSV)",
+                data=audit_df.to_csv(index=False),
+                file_name="case_audit_log.csv",
+                mime="text/csv",
+            )
         else:
             st.info("Audit log will appear once some cases are auto-resolved.")
 
