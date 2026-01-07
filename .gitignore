@@ -1,11 +1,31 @@
-# Data & models (ignore raw data, but keep artifacts)
+############################
+# Runtime artifacts (DO NOT COMMIT)
+############################
+artifacts/
+*.db
+
+############################
+# Python
+############################
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv
+venv/
+
+############################
+# Data & models (raw / training only)
+############################
 data/
 datasets/
 models/
 checkpoints/
 data_raw/
 
-# Ignore large file types globally...
+############################
+# Large file types (never commit)
+############################
 *.pt
 *.h5
 *.sav
@@ -14,9 +34,9 @@ data_raw/
 *.parquet
 *.pkl
 
-# ...BUT keep all artifacts tracked
-!artifacts/
-!artifacts/*.pkl
-!artifacts/*.csv
-!artifacts/*.parquet
-!artifacts/*.json
+############################
+# OS / editor noise
+############################
+.DS_Store
+.idea/
+.vscode/
