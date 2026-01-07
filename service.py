@@ -8,11 +8,8 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# SQLite storage helpers (you must have storage.py in the same folder)
 from storage import init_db, insert_live_event, get_conn
 
-
-# ---------------- Paths & constants ----------------
 ART = Path("artifacts")
 ART.mkdir(parents=True, exist_ok=True)
 
@@ -21,11 +18,15 @@ FEATS_PATH = ART / "feature_cols.json"
 THRESH_PATH = ART / "threshold.json"       # fallback
 MODEL_META_PATH = ART / "model_meta.json"  # preferred selector
 
-MAX_EVENTS = 100_000  # keep at most this many events in the DB table
+MAX_EVENTS = 100_000  # hard cap
 
+app = FastAPI(title="Fraud Scoring Service")
 
-# ---------------- Load features ----------------
-features = json.loads(FEATS_PATH.read_text())
+# Globals (populated at startup)
+MODEL = None
+THRESHOLD = None
+FEATURES = None
+LOAD_ERROR = None
 
 
 def _load_model_and_threshold():
@@ -35,23 +36,17 @@ def _load_model_and_threshold():
     """
     # Preferred path: model_meta.json
     if MODEL_META_PATH.exists():
-        try:
-            mm = json.loads(MODEL_META_PATH.read_text())
-            active = mm.get("active_model", "random_forest")
-            models = mm.get("models", {})
-            conf = models.get(active)
-            if conf and "path" in conf and "best_threshold" in conf:
-                model_file = ART / conf["path"]
-                if model_file.exists():
-                    model = joblib.load(model_file)
-                    thr = float(conf["best_threshold"])
-                    print(
-                        f"[service] Loaded active model '{active}' "
-                        f"from {model_file} with threshold {thr:.6f}"
-                    )
-                    return model, thr
-        except Exception as e:
-            print(f"[service] Failed to read model_meta.json, falling back. Error: {e}")
+        mm = json.loads(MODEL_META_PATH.read_text())
+        active = mm.get("active_model", "random_forest")
+        models = mm.get("models", {}) or {}
+        conf = models.get(active)
+        if conf and "path" in conf and "best_threshold" in conf:
+            model_file = ART / conf["path"]
+            if model_file.exists():
+                model = joblib.load(model_file)
+                thr = float(conf["best_threshold"])
+                print(f"[service] Loaded active model '{active}' from {model_file} thr={thr:.6f}")
+                return model, thr
 
     # Fallback: RF + threshold.json
     model = joblib.load(MODEL_PATH)
@@ -61,21 +56,14 @@ def _load_model_and_threshold():
     else:
         thr = 0.025
 
-    print(f"[service] Loaded fallback RF model {MODEL_PATH} with threshold {thr:.6f}")
+    print(f"[service] Loaded fallback RF model {MODEL_PATH} thr={thr:.6f}")
     return model, thr
 
 
-model, THRESHOLD = _load_model_and_threshold()
-
-
 def _trim_live_events_db():
-    """
-    Keep only the most recent MAX_EVENTS rows in SQLite.
-    This is safe and avoids the DB growing forever.
-    """
+    """Keep only the most recent MAX_EVENTS rows in SQLite."""
     try:
         with get_conn() as conn:
-            # Delete anything older than the last MAX_EVENTS event_ids
             conn.execute(
                 """
                 DELETE FROM live_events
@@ -88,19 +76,34 @@ def _trim_live_events_db():
                 (int(MAX_EVENTS),),
             )
     except Exception as e:
-        # Non-fatal
         print(f"[WARN] Failed to trim live_events table: {e}")
 
 
-# ---------------- FastAPI app ----------------
-app = FastAPI(title="Fraud Scoring Service")
+@app.on_event("startup")
+def _startup():
+    global MODEL, THRESHOLD, FEATURES, LOAD_ERROR
 
-# Ensure DB/tables exist (safe to call on every startup)
-init_db()
+    # DB always initialised (so /health works even if artifacts are broken)
+    init_db()
+
+    try:
+        FEATURES = json.loads(FEATS_PATH.read_text())
+        MODEL, THRESHOLD = _load_model_and_threshold()
+        LOAD_ERROR = None
+        print("[service] Startup OK.")
+    except Exception as e:
+        # Do NOT crash the service; keep it up and report degraded health.
+        MODEL = None
+        THRESHOLD = None
+        FEATURES = None
+        LOAD_ERROR = str(e)
+        print(f"[service] Startup DEGRADED: {LOAD_ERROR}")
 
 
 @app.get("/health")
 def health():
+    if LOAD_ERROR:
+        return {"status": "degraded", "error": LOAD_ERROR}
     return {"status": "ok"}
 
 
@@ -110,41 +113,36 @@ class Tx(BaseModel):
 
 @app.post("/score")
 def score(tx: Tx):
+    if LOAD_ERROR or MODEL is None or FEATURES is None or THRESHOLD is None:
+        raise HTTPException(status_code=503, detail="Service not ready (missing artifacts/model).")
+
     # Validate and order features
     try:
         payload = dict(tx.data)
 
-        # Backward compatible: if older artifacts still expect "id", neutralize it.
-        if "id" in features:
+        # Backward compatible: if older artifacts still expect "id", neutralise it.
+        if "id" in FEATURES:
             payload["id"] = 0.0
         else:
             payload.pop("id", None)
 
-        x = pd.DataFrame([payload])[features]
-
+        x = pd.DataFrame([payload])[FEATURES]
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Payload missing required feature columns",
-        )
+        raise HTTPException(status_code=400, detail="Payload missing required feature columns")
 
-    # Model prediction (RF or other, depending on active model)
-    proba = float(model.predict_proba(x)[:, 1][0])
+    proba = float(MODEL.predict_proba(x)[:, 1][0])
     decision = "REVIEW" if proba >= THRESHOLD else "APPROVE"
 
-    # Write event atomically to SQLite (no CSV corruption possible)
     ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
     event_id = insert_live_event(
         ts=ts,
         decision=decision,
         proba=proba,
-        payload=tx.data,   # store original payload
+        payload=tx.data,
     )
 
-    # Keep DB size bounded
     _trim_live_events_db()
 
-    # Return result
     return {
         "event_id": event_id,
         "decision": decision,
