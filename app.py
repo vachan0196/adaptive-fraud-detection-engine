@@ -1,979 +1,251 @@
 # app.py
+import os
 import json
-from pathlib import Path
-from typing import Tuple
-from datetime import datetime, timedelta
+import sqlite3
+from datetime import datetime
+from typing import Optional
 
-import joblib
-import numpy as np
 import pandas as pd
-import shap
+import requests
 import streamlit as st
-import matplotlib.pyplot as plt
-import plotly.express as px
-import plotly.graph_objects as go
-# ---------- SQLite storage ----------
-from storage import init_db, get_conn, insert_audit_row
 
-# Ensure DB & tables exist on app startup
-init_db()
+DB_PATH = "artifacts/app.db"
+SERVICE_URL = os.getenv("SERVICE_URL", "http://127.0.0.1:8000")
 
-from streamlit_option_menu import option_menu
-from streamlit_autorefresh import st_autorefresh
+st.set_page_config(page_title="Adaptive Fraud Detection Engine", layout="wide")
 
 
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
 
 
-
-# ---------- page config ----------
-st.set_page_config(page_title="Fraud Detection — Cost-Optimised", layout="wide")
-
-# ---------- paths ----------
-ART_DIR       = Path("artifacts")
-MODEL_PATH    = ART_DIR / "rf_model.pkl"          # legacy default
-MODEL_META_PATH = ART_DIR / "model_meta.json"     # new multi-model metadata
-FEATS_PATH    = ART_DIR / "feature_cols.json"
-META_PATH     = ART_DIR / "metadata.json"
-THRESH_PATH   = ART_DIR / "threshold.json"
-SAMPLES_PATH  = ART_DIR / "demo_samples.parquet"
-SIM_POOL_PATH = ART_DIR / "sim_pool.parquet"
-
-LIVE_LOG      = ART_DIR / "live_events.csv"
-CASES_PATH    = ART_DIR / "cases.csv"
-AUDIT_PATH    = ART_DIR / "case_audit_log.csv"
-
-UI_LIVE_READ_CAP = 100_000    # hard cap for live_events
-MAX_CASE_ROWS = 200_000   # hard cap for cases / audit
-
-# ---------- SQLite readers ----------
-def read_live_events(limit: int = UI_LIVE_READ_CAP) -> pd.DataFrame:
-    """
-    Read recent live events from SQLite instead of CSV.
-    Keeps column names identical to the old CSV-based pipeline.
-    """
+def current_run_id() -> int:
     with get_conn() as conn:
-        return pd.read_sql_query(
+        row = conn.execute("SELECT value FROM app_state WHERE key='current_run_id' LIMIT 1;").fetchone()
+    return int(row["value"]) if row else 0
+
+
+def read_live_events(run_id: int, limit: int = 2000) -> pd.DataFrame:
+    with get_conn() as conn:
+        rows = conn.execute(
             """
-            SELECT
-                event_id,
-                ts,
-                decision,
-                proba,
-                payload_json AS payload
+            SELECT event_id, ts, decision, proba, payload_json
             FROM live_events
+            WHERE run_id=?
             ORDER BY event_id DESC
-            LIMIT ?
+            LIMIT ?;
             """,
-            conn,
-            params=(int(limit),),
-        )
-
-def read_audit_log(limit: int = 5000) -> pd.DataFrame:
-    """Read recent case audit rows from SQLite (source of truth)."""
-    with get_conn() as conn:
-        return pd.read_sql_query(
-            """
-            SELECT
-                id,
-                event_id,
-                old_status,
-                new_status,
-                source,
-                proba,
-                ts,
-                logged_at
-            FROM case_audit_log
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            conn,
-            params=(int(limit),),
-        )
-
-# ---------- utils ----------
-def load_artifacts() -> Tuple[object, list, dict, dict, pd.DataFrame | None, dict | None]:
-    """
-    Super-defensive loader used inside Streamlit.
-
-    We intentionally removed the @st.cache_resource decorator because in
-    some runs Streamlit was hanging on “Running load_artifacts()”.
-    This version does the same work but:
-      - gives clear error messages if something is missing/corrupted
-      - falls back safely when model_meta.json is broken.
-    """
-    # ---- features / meta / threshold ----
-    try:
-        features = json.loads(FEATS_PATH.read_text())
-    except Exception as e:
-        st.error(f"Failed to read {FEATS_PATH}: {e}")
-        st.stop()
-
-    try:
-        meta = json.loads(META_PATH.read_text())
-    except Exception as e:
-        st.error(f"Failed to read {META_PATH}: {e}")
-        st.stop()
-
-    try:
-        thr = json.loads(THRESH_PATH.read_text())
-    except Exception as e:
-        st.error(f"Failed to read {THRESH_PATH}: {e}")
-        st.stop()
-
-    # ---- optional samples ----
-    samples: pd.DataFrame | None = None
-    if SAMPLES_PATH.exists():
-        try:
-            samples = pd.read_parquet(SAMPLES_PATH)
-        except Exception as e:
-            st.warning(f"Could not read {SAMPLES_PATH}: {e}")
-
-    # ---- model & model_meta ----
-    model_meta: dict | None = None
-    model_path = MODEL_PATH  # default RF model
-
-    if MODEL_META_PATH.exists():
-        try:
-            model_meta = json.loads(MODEL_META_PATH.read_text())
-            active_key = model_meta.get("active_model")
-            models_info = model_meta.get("models", {}) or {}
-            active_info = models_info.get(active_key, {}) if active_key else {}
-
-            rel_path = active_info.get("path")
-            if rel_path:
-                candidate = ART_DIR / rel_path
-                if candidate.exists():
-                    model_path = candidate
-        except Exception as e:
-            # if anything goes wrong we just fall back to rf_model.pkl
-            st.warning(
-                f"Ignoring model_meta.json due to error: {e}. "
-                "Falling back to rf_model.pkl."
-            )
-
-    try:
-        model = joblib.load(model_path)
-    except Exception as e:
-        st.error(f"Failed to load model from {model_path}: {e}")
-        st.stop()
-
-    return model, features, meta, thr, samples, model_meta
-
-
-# actually load everything once at startup
-rf, feature_cols, meta, thr, samples, model_meta = load_artifacts()
-# --- safety: do not allow identifier leakage in the app layer ---
-if "id" in feature_cols:
-    st.warning(
-        "Identifier column 'id' detected in feature list. "
-        "It will be neutralised at inference time to prevent leakage."
-    )
-
-default_threshold = float(thr.get("threshold", 0.025))
-C_FN, C_FP = int(thr.get("C_FN", 100)), int(thr.get("C_FP", 1))
-
-
-def trim_csv(path: Path, max_rows: int, sort_col: str) -> None:
-    """Keep only the most recent max_rows rows based on sort_col."""
-    if not path.exists():
-        return
-    try:
-        df = pd.read_csv(path)
-        if len(df) > max_rows and sort_col in df.columns:
-            df = df.sort_values(sort_col).tail(max_rows)
-            df.to_csv(path, index=False)
-    except Exception:
-        # best-effort; don't crash the app
-        return
-
-
-def shap_for_binary(model, X_row: pd.DataFrame) -> np.ndarray:
-    """Return SHAP values for class=1 for a single-row DF, robust across SHAP versions."""
-    explainer = shap.TreeExplainer(model)
-    sv = explainer.shap_values(X_row)
-    if isinstance(sv, (list, tuple)):
-        return np.array(sv[1][0])
-    if hasattr(sv, "ndim") and sv.ndim == 3:
-        return sv[0, :, 1]
-    if hasattr(sv, "ndim") and sv.ndim == 2:
-        return sv[0]
-    return np.ravel(sv)
-
-
-def make_empty_template():
-    return pd.DataFrame([[0.0] * len(feature_cols)], columns=feature_cols)
-
-
-def set_defaults_from_series(s: pd.Series):
-    d = {k: float(s.get(k, 0.0)) for k in feature_cols}
-    if "id" in d:
-        d["id"] = 0.0
-    st.session_state["defaults"] = d
-
-
-def get_default_value(col, fallback):
-    return st.session_state.get("defaults", {}).get(col, fallback)
-
-
-def style_livefeed(df: pd.DataFrame):
-    """Color rows: REVIEW=red, APPROVE=green; format proba as %."""
-    def _row_style(row):
-        is_review = str(row.get("decision", "")).upper() == "REVIEW"
-        color = "#5a0e0e" if is_review else "#0e5a2b"
-        return [f"background-color:{color}; color:#ffffff;"] * len(row)
-
-    fmt = {"proba": lambda v: f"{float(v)*100:.2f}%"}
-    return (df.style
-              .apply(_row_style, axis=1)
-              .format(fmt)
-              .set_properties(**{"border-color": "#222"}))
-
-
-def ensure_live_log_schema():
-    """SQLite is the source of truth now."""
-    init_db()
-    return
-
-def ensure_cases_schema():
-    """Make sure cases.csv exists with event_id as primary reference."""
-    if not CASES_PATH.exists():
-        cols = [
-            "event_id",
-            "ts",
-            "proba",
-            "status",
-            "customer_response",
-            "resolution_source",
-            "updated_at",
-        ]
-        pd.DataFrame(columns=cols).to_csv(CASES_PATH, index=False)
-        return
-
-    df = pd.read_csv(CASES_PATH)
-    changed = False
-    if "event_id" not in df.columns:
-        # old version had ts as key; fabricate event_id
-        df.insert(0, "event_id", range(1, len(df) + 1))
-        changed = True
-    for col in ["ts", "proba", "status", "customer_response",
-                "resolution_source", "updated_at"]:
-        if col not in df.columns:
-            df[col] = "" if col in ("status", "customer_response", "resolution_source", "updated_at") else np.nan
-            changed = True
-    if changed:
-        df.to_csv(CASES_PATH, index=False)
-
-
-def sync_cases_from_live() -> pd.DataFrame:
-    """
-    Build / update a simple cases table from SQLite live_events.
-    - Every REVIEW transaction becomes / remains a case.
-    - New REVIEWs get status=PENDING by default.
-    Return merged DataFrame.
-    """
-    ensure_live_log_schema()
-    ensure_cases_schema()
-
-    trim_csv(CASES_PATH, MAX_CASE_ROWS, "event_id")
-
-    live = read_live_events(UI_LIVE_READ_CAP)
-    cases = pd.read_csv(CASES_PATH)
-
-
-    if live.empty:
-        return cases
-
-    live["decision"] = live["decision"].astype(str).str.upper()
-    reviews = live[live["decision"] == "REVIEW"].copy()
-
-    if reviews.empty:
-        return cases
-
-    # Make sure event_id exists and is unique
-    if "event_id" not in reviews.columns:
-        reviews["event_id"] = range(1, len(reviews) + 1)
-
-    reviews = reviews[["event_id", "ts", "proba"]]
-
-    # Add missing review events as new cases
-    if "event_id" not in cases.columns:
-        cases["event_id"] = pd.Series(dtype=int)
-
-    new_mask = ~reviews["event_id"].isin(cases["event_id"])
-    if new_mask.any():
-        new_cases = reviews.loc[new_mask].copy()
-        new_cases["status"] = "PENDING"
-        new_cases["customer_response"] = ""
-        new_cases["resolution_source"] = ""
-        new_cases["updated_at"] = ""
-        cases = pd.concat([cases, new_cases], ignore_index=True)
-
-    # Update ts/proba in case they changed
-    cases = cases.merge(
-        reviews,
-        on="event_id",
-        how="left",
-        suffixes=("", "_live"),
-    )
-    for col in ["ts", "proba"]:
-        live_col = f"{col}_live"
-        cases[col] = np.where(
-            cases[live_col].notna(), cases[live_col], cases[col]
-        )
-        cases.drop(columns=[live_col], inplace=True)
-
-    cases.to_csv(CASES_PATH, index=False)
-    return cases
-
-
-def append_audit_row(event_id: int, old_status: str, new_status: str,
-                     source: str, proba: float, ts: str):
-
-    """Append a row to SQLite audit log (atomic)."""
-    row = {
-         "event_id": event_id,
-         "old_status": old_status,
-         "new_status": new_status,
-         "source": source,
-         "proba": float(proba) if proba is not None else None,
-         "ts": ts,
-         "logged_at": datetime.utcnow().isoformat(timespec="seconds"),
-    }
-    insert_audit_row(row)
-
-
-def auto_resolve_cases(
-    cases: pd.DataFrame,
-    threshold: float,
-    demo_enabled: bool = True
-) -> pd.DataFrame:
-    """
-    Demo auto-resolution logic to simulate customer responses / fraud backoffice.
-
-    Interpretation:
-      - customer_response = "YES"  -> customer authorised -> LEGIT
-      - customer_response = "NO"   -> customer did NOT authorise -> FRAUD
-    """
-    if not demo_enabled or cases.empty:
-        return cases
-
-    now = datetime.utcnow()
-    df = cases.copy()
-
-    pending_mask = df["status"].astype(str).str.upper().eq("PENDING")
-    if not pending_mask.any():
-        return df
-
-    df_pending = df[pending_mask].copy()
-
-    # parse timestamps, treat as naive UTC
-    ts_vals = pd.to_datetime(df_pending["ts"], errors="coerce")
-    age_minutes = ((now - ts_vals).dt.total_seconds() / 60.0).fillna(0)
-
-    proba = df_pending["proba"].astype(float).fillna(0.0)
-
-    # Rules (tweakable):
-    # - High confidence (>= 0.90) and age >= 2 min -> mostly FRAUD, small % LEGIT (false positives)
-    # - Borderline review band (threshold .. 0.30) and age >= 5 min -> mostly LEGIT
-    # - Medium (0.30 .. 0.90) and age >= 10 min -> mix, biased to fraud
-    hi_mask  = (proba >= 0.90) & (age_minutes >= 2)
-    low_mask = (proba >= threshold) & (proba < 0.30) & (age_minutes >= 5)
-    mid_mask = (proba >= 0.30) & (proba < 0.90) & (age_minutes >= 10)
-
-    for idx in df_pending.index:
-        eid = int(df_pending.loc[idx, "event_id"])
-        p = float(proba.loc[idx])
-        ts_str = str(df_pending.loc[idx, "ts"])
-        old_status = str(df_pending.loc[idx, "status"])
-
-        if hi_mask.loc[idx]:
-            # Even very high proba alerts can be false positives in real operations.
-            # Keep this small so it still "feels" like fraud is dominant.
-            # If your proba is often exactly 1.0, this is the only way you'll ever see legit.
-            p_legit = max(0.02, 0.10 * (1.0 - p))  # between ~2% and 10%
-            if np.random.rand() < p_legit:
-                new_status = "CONFIRMED_LEGIT"
-                cust_resp = "YES"
-            else:
-                new_status = "CONFIRMED_FRAUD"
-                cust_resp = "NO"
-
-        elif low_mask.loc[idx]:
-            # Borderline review cases are more likely to be legit
-            if np.random.rand() < 0.75:
-                new_status = "CONFIRMED_LEGIT"
-                cust_resp = "YES"
-            else:
-                new_status = "CONFIRMED_FRAUD"
-                cust_resp = "NO"
-
-        elif mid_mask.loc[idx]:
-            # Medium band: biased coin (fraud heavy but still some legit)
-            if np.random.rand() < 0.70:
-                new_status = "CONFIRMED_FRAUD"
-                cust_resp = "NO"
-            else:
-                new_status = "CONFIRMED_LEGIT"
-                cust_resp = "YES"
-
-        else:
-            continue  # still pending
-
-        df.loc[df["event_id"] == eid, "status"] = new_status
-        df.loc[df["event_id"] == eid, "customer_response"] = cust_resp
-        df.loc[df["event_id"] == eid, "resolution_source"] = "AUTO_DEMO"
-        df.loc[df["event_id"] == eid, "updated_at"] = now.isoformat(timespec="seconds")
-
-        append_audit_row(
-            event_id=eid,
-            old_status=old_status,
-            new_status=new_status,
-            source="AUTO_DEMO",
-            proba=p,
-            ts=ts_str,
-        )
-
-    df.to_csv(CASES_PATH, index=False)
+            (run_id, int(limit)),
+        ).fetchall()
+    df = pd.DataFrame([dict(r) for r in rows])
+    if not df.empty:
+        df["payload"] = df["payload_json"].apply(lambda s: json.loads(s) if isinstance(s, str) else s)
     return df
 
 
-# ---------- header ----------
-st.title("Adaptive Fraud Detection Engine ▸ Real-Time ML + Auto-Case Resolution")
+def read_cases(run_id: int, limit: int = 2000, status: Optional[str] = None) -> pd.DataFrame:
+    where = "WHERE c.run_id=?"
+    params = [run_id]
+    if status:
+        where += " AND c.status=?"
+        params.append(status)
 
-model_name = "RandomForest (legacy)"
-if model_meta:
-    active_key = model_meta.get("active_model")
-    models_info = model_meta.get("models", {}) or {}
-    info = models_info.get(active_key, {})
-    model_name = info.get("name") or active_key or model_name
+    q = f"""
+    SELECT
+      c.event_id,
+      e.ts AS event_ts,
+      e.proba,
+      e.decision,
+      c.status,
+      c.customer_response,
+      c.resolution_source,
+      c.created_at,
+      c.updated_at
+    FROM cases c
+    JOIN live_events e ON e.event_id = c.event_id
+    {where}
+    ORDER BY COALESCE(c.updated_at, c.created_at) DESC, c.event_id DESC
+    LIMIT ?;
+    """
+    params.append(int(limit))
 
-st.caption(
-    "  |  ".join([
-        f"Default operating threshold: **{default_threshold:.4f}**",
-        f"Cost ratio: FN = {C_FN}×, FP = {C_FP}×",
-        f"Active model: {model_name}",
-        "Offline-validated model (cost-optimised)",
-    ])
-)
-
-
-# exact 4-decimal threshold selector
-options = [i / 10000 for i in range(0, 2001)]  # 0.0000 .. 0.2000
-threshold = st.select_slider(
-    "Operating threshold (demo override)",
-    options=options,
-    value=min(options, key=lambda v: abs(v - default_threshold)),
-    format_func=lambda v: f"{v:.4f}",
-    help="Overrides the default threshold from artifacts/threshold.json for demo purposes.",
-)
-st.caption(f"Current threshold: **{threshold:.4f}**")
-
-# ---------- top “tabs” ----------
-selected = option_menu(
-    None,
-    ["Live Feed", "Ops Analytics", "Batch Scoring", "Single Transaction", "Cases"],
-    icons=["activity", "bar-chart", "cloud-upload", "sliders", "folder-check"],
-    orientation="horizontal",
-    default_index=0,
-)
-
-# =========================================================
-# ======================== LIVE FEED ======================
-# =========================================================
-if selected == "Live Feed":
-    st_autorefresh(interval=2000, key="live_tick")
-
-    st.subheader("Live Events")
-    ensure_live_log_schema()
-
-    try:
-        feed = read_live_events(UI_LIVE_READ_CAP)
-
-        if not feed.empty:
-            feed = feed.sort_values("event_id", ascending=False).head(300)
-
-            df_disp = feed[["event_id", "ts", "proba", "decision"]].copy()
-            st.table(style_livefeed(df_disp))
-
-            with st.expander("🔎 Inspect payload JSON for a specific row"):
-                feed["_label"] = (
-                    feed["event_id"].astype(str)
-                    + " | "
-                    + feed["ts"].astype(str)
-                    + " | "
-                    + feed["decision"].astype(str)
-                    + " | "
-                    + (feed["proba"] * 100).round(2).astype(str)
-                    + "%"
-                )
-
-                idx = st.selectbox(
-                    "Select a row",
-                    options=list(feed.index),
-                    format_func=lambda i: feed.loc[i, "_label"],
-                )
-
-                raw = feed.loc[idx, "payload"]
-                try:
-                    payload_obj = json.loads(raw) if isinstance(raw, str) else raw
-                except Exception:
-                    payload_obj = {
-                        "ERROR": {
-                            "message": "payload must be a valid JSON object"
-                        }
-                    }
-
-                st.json(payload_obj)
-
-        else:
-            st.info("Waiting for events… start the simulator.")
-
-    except Exception as e:
-        st.error("Failed to read live log.")
-        st.exception(e)
+    with get_conn() as conn:
+        rows = conn.execute(q, params).fetchall()
+    return pd.DataFrame([dict(r) for r in rows])
 
 
-# =========================================================
-# ===================== OPS ANALYTICS =====================
-# =========================================================
-elif selected == "Ops Analytics":
-    st.subheader("Operational Analytics")
-    ensure_live_log_schema()
+def read_audit(run_id: int, limit: int = 2000) -> pd.DataFrame:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, event_id, old_status, new_status, source, proba, ts, logged_at
+            FROM case_audit_log
+            WHERE run_id=?
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (run_id, int(limit)),
+        ).fetchall()
+    return pd.DataFrame([dict(r) for r in rows])
 
-    try:
-        df = read_live_events(UI_LIVE_READ_CAP)
 
-        if df.empty:
-            st.info("No events to analyse yet.")
-        else:
-            df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-            df = df.dropna(subset=["ts"])
-            df["hour"] = df["ts"].dt.hour
-            df["dow"] = df["ts"].dt.day_name()
-            df["is_review"] = (df["decision"].astype(str).str.upper() == "REVIEW").astype(int)
+def analytics_snapshot(run_id: int) -> dict:
+    with get_conn() as conn:
+        ev = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS n,
+              SUM(CASE WHEN decision='REVIEW' THEN 1 ELSE 0 END) AS n_review,
+              SUM(CASE WHEN decision='APPROVE' THEN 1 ELSE 0 END) AS n_approve,
+              AVG(proba) AS avg_proba
+            FROM live_events
+            WHERE run_id=?;
+            """,
+            (run_id,),
+        ).fetchone()
 
-            # ---------- Event-level KPIs ----------
-            col1, col2, col3, col4 = st.columns(4)
-            last60 = df[df["ts"] >= df["ts"].max() - pd.Timedelta(minutes=60)]
+        cs = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS n_cases,
+              SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END) AS n_pending,
+              SUM(CASE WHEN status='CONFIRMED_FRAUD' THEN 1 ELSE 0 END) AS n_fraud,
+              SUM(CASE WHEN status='CONFIRMED_LEGIT' THEN 1 ELSE 0 END) AS n_legit,
+              SUM(CASE WHEN status='DISMISSED' THEN 1 ELSE 0 END) AS n_dismissed
+            FROM cases
+            WHERE run_id=?;
+            """,
+            (run_id,),
+        ).fetchone()
 
-            with col1:
-                st.metric("Tx / min (last 60m)", f"{len(last60) / 60:.1f}")
+    return {
+        "events": int(ev["n"] or 0),
+        "approve": int(ev["n_approve"] or 0),
+        "review": int(ev["n_review"] or 0),
+        "avg_proba": float(ev["avg_proba"] or 0.0),
+        "cases": int(cs["n_cases"] or 0),
+        "pending": int(cs["n_pending"] or 0),
+        "fraud": int(cs["n_fraud"] or 0),
+        "legit": int(cs["n_legit"] or 0),
+        "dismissed": int(cs["n_dismissed"] or 0),
+    }
 
-            with col2:
-                st.metric("Review rate (overall)", f"{df['is_review'].mean():.1%}")
 
-            with col3:
-                st.metric(
-                    "Avg proba (REVIEW)",
-                    f"{df.loc[df.is_review == 1, 'proba'].mean():.2%}",
-                )
+def api_post(path: str, payload: dict):
+    url = f"{SERVICE_URL}{path}"
+    r = requests.post(url, json=payload, timeout=10)
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.status_code}: {r.text}")
+    return r.json()
 
-            with col4:
-                st.metric(
-                    "p95 proba (REVIEW)",
-                    f"{df.loc[df.is_review == 1, 'proba'].quantile(0.95):.2%}",
-                )
 
-            # ---------- Case-level KPIs ----------
-            cases = sync_cases_from_live()
-            if not cases.empty:
-                cases["status"] = cases["status"].astype(str).str.upper()
-                total_cases = len(cases)
-                pending_cases = cases[cases["status"] == "PENDING"]
-                resolved = cases[cases["status"] != "PENDING"]
-                confirmed_fraud = cases[cases["status"] == "CONFIRMED_FRAUD"]
-                confirmed_legit = cases[cases["status"] == "CONFIRMED_LEGIT"]
+# ---------------- UI ----------------
+st.title("Adaptive Fraud Detection Engine (Demo SaaS)")
 
-                resolution_rate = len(resolved) / total_cases if total_cases > 0 else 0.0
-                confirmed_fraud_rate = len(confirmed_fraud) / len(resolved) if len(resolved) > 0 else 0.0
-                false_positive_rate = len(confirmed_legit) / len(resolved) if len(resolved) > 0 else 0.0
-                backlog = len(pending_cases)
+run_id = current_run_id()
 
-                avg_res_minutes = None
-                if len(resolved) > 0 and "updated_at" in resolved.columns:
-                    try:
-                        ts_dt = pd.to_datetime(resolved["ts"], errors="coerce")
-                        upd_dt = pd.to_datetime(resolved["updated_at"], errors="coerce")
-                        mask = ts_dt.notna() & upd_dt.notna()
-                        if mask.any():
-                            deltas = (upd_dt[mask] - ts_dt[mask]).dt.total_seconds()
-                            avg_res_minutes = deltas.mean() / 60.0
-                    except Exception:
-                        avg_res_minutes = None
+top = st.columns([1.2, 1.2, 1.2, 1.2, 2.2])
+snap = analytics_snapshot(run_id)
 
-                c5, c6, c7, c8 = st.columns(4)
-                with c5:
-                    st.metric("Total cases", total_cases)
-                with c6:
-                    st.metric("Case resolution rate", f"{resolution_rate:.1%}")
-                with c7:
-                    st.metric("Confirmed fraud rate", f"{confirmed_fraud_rate:.1%}")
-                with c8:
-                    fp_text = f"{false_positive_rate:.1%}"
-                    if backlog > 0:
-                        fp_text += f"  |  Backlog: {backlog}"
-                    st.metric("False positive rate", fp_text)
+top[0].metric("Run ID", run_id)
+top[1].metric("Live Events", snap["events"])
+top[2].metric("Review Queue", snap["pending"])
+top[3].metric("Approve / Review", f'{snap["approve"]} / {snap["review"]}')
+top[4].metric("Avg Risk", f'{snap["avg_proba"]:.4f}')
 
-                if avg_res_minutes is not None:
-                    st.caption(
-                        f"Average time to resolution: {avg_res_minutes:.1f} minutes "
-                        f"(for resolved cases with timestamps)."
-                    )
-                else:
-                    st.caption("Average time to resolution: not enough resolved cases with timestamps yet.")
-            else:
-                st.info(
-                    "Case queue not initialised yet. Let the simulator run to create some REVIEW transactions."
-                )
+st.divider()
 
-            # ---------- charts ----------
-            c1, c2 = st.columns(2)
-            ts_agg = (
-                df.set_index("ts")
-                .resample("1min")["is_review"]
-                .agg(["count", "mean"])
-                .fillna(0)
-            )
+with st.sidebar:
+    st.header("Controls (via FastAPI)")
+    st.caption(f"SERVICE_URL: {SERVICE_URL}")
 
-            # Tx per minute (Plotly)
-            with c1:
-                fig1 = go.Figure()
-                fig1.add_trace(
-                    go.Scatter(
-                        x=ts_agg.index,
-                        y=ts_agg["count"],
-                        mode="lines",
-                        name="Tx / min",
-                    )
-                )
-                fig1.add_trace(
-                    go.Scatter(
-                        x=ts_agg.index,
-                        y=ts_agg["count"].rolling(5, min_periods=1).mean(),
-                        mode="lines",
-                        name="Rolling avg (5 min)",
-                        line=dict(dash="dash"),
-                    )
-                )
-                fig1.update_layout(
-                    title="Transactions per minute (with rolling avg)",
-                    xaxis_title="Time",
-                    yaxis_title="Count",
-                )
-                fig1.update_xaxes(tickangle=-30)
-                st.plotly_chart(fig1, use_container_width=True)
+    if st.button("Reset Demo (new run_id)", use_container_width=True):
+        out = api_post("/admin/reset", {"label": "demo reset"})
+        st.success(f"Reset OK → new_run_id={out['new_run_id']}")
+        st.rerun()
 
-            # Review rate per minute (Plotly)
-            with c2:
-                fig2 = go.Figure()
-                fig2.add_trace(
-                    go.Scatter(
-                        x=ts_agg.index,
-                        y=ts_agg["mean"],
-                        mode="lines",
-                        name="Review rate / min",
-                    )
-                )
-                fig2.add_trace(
-                    go.Scatter(
-                        x=ts_agg.index,
-                        y=ts_agg["mean"].rolling(5, min_periods=1).mean(),
-                        mode="lines",
-                        name="Rolling avg (5 min)",
-                        line=dict(dash="dash"),
-                    )
-                )
-                fig2.update_layout(
-                    title="Review rate per minute (with rolling avg)",
-                    xaxis_title="Time",
-                    yaxis_title="Rate",
-                )
-                fig2.update_xaxes(tickangle=-30)
-                st.plotly_chart(fig2, use_container_width=True)
+    st.subheader("Auto-resolve (demo)")
+    auto_on = st.toggle("Enable auto-resolve calls", value=False)
+    high = st.slider("High fraud threshold", 0.50, 0.999, 0.95, 0.001)
+    low = st.slider("Low legit threshold", 0.0, 0.20, 0.02, 0.001)
+    max_per = st.number_input("Max per call", min_value=1, max_value=2000, value=200, step=50)
 
-            c3, c4 = st.columns(2)
+    if st.button("Run auto-resolve once", use_container_width=True):
+        out = api_post("/demo/auto_resolve", {"high_fraud": high, "low_legit": low, "max_per_call": int(max_per)})
+        st.info(f"Resolved {out['resolved']} of {out['checked']} checked")
+        st.rerun()
 
-            # Distribution of predicted probability (Plotly)
-            with c3:
-                fig3 = px.histogram(
-                    df,
-                    x="proba",
-                    nbins=30,
-                    title="Distribution of predicted probability",
-                )
-                fig3.update_layout(
-                    xaxis_title="Probability",
-                    yaxis_title="Frequency",
-                )
-                st.plotly_chart(fig3, use_container_width=True)
-
-            # ---------- Heatmap: Review rate by Day × Hour (Plotly) ----------
-            with c4:
-                pivot = (
-                    df.pivot_table(
-                        index="dow",
-                        columns="hour",
-                        values="is_review",
-                        aggfunc="mean",
-                    )
-                    .reindex(
-                        [
-                            "Monday",
-                            "Tuesday",
-                            "Wednesday",
-                            "Thursday",
-                            "Friday",
-                            "Saturday",
-                            "Sunday",
-                        ]
-                    )
-                )
-
-                all_hours = list(range(24))
-                pivot = pivot.reindex(columns=all_hours)
-
-                if pivot.isna().all().all():
-                    st.info("Not enough data to build the day × hour heatmap yet.")
-                else:
-                    fig4 = px.imshow(
-                        pivot.values,
-                        x=[str(h) for h in pivot.columns],
-                        y=list(pivot.index),
-                        color_continuous_scale="Plasma",
-                        zmin=0,
-                        zmax=0.30,
-                        labels={"color": "Review rate"},
-                        aspect="auto",
-                    )
-                    fig4.update_layout(
-                        title="Review rate heatmap (Day of week × Hour)",
-                        xaxis_title="Hour of Day",
-                        yaxis_title="Day of Week",
-                    )
-
-                    text = pivot.applymap(lambda v: f"{v:.0%}" if pd.notna(v) else "").values
-                    fig4.update_traces(
-                        text=text,
-                        texttemplate="%{text}",
-                        textfont_size=9,
-                    )
-
-                    st.plotly_chart(fig4, use_container_width=True)
-
-    except Exception as e:
-        st.error("Failed to compute analytics.")
-        st.exception(e)
-
-# =========================================================
-# ===================== BATCH SCORING =====================
-# =========================================================
-elif selected == "Batch Scoring":
-    st.subheader("Upload CSV to score multiple transactions")
-    st.markdown(
-        "- Use this when you want to score **many transactions at once** "
-        "(e.g., a daily extract).\n"
-        "- Click **Download CSV Template**, keep the header names unchanged, "
-        "fill rows in the same order, then upload the file.\n"
-        "- The app returns a scored CSV with `fraud_proba` and a business "
-        "decision (`APPROVE` / `REVIEW`) at the current threshold."
-    )
-
-    st.download_button(
-        "Download CSV Template",
-        data=make_empty_template().to_csv(index=False),
-        file_name="fraud_scoring_template.csv",
-        mime="text/csv",
-    )
-
-    file = st.file_uploader("Upload CSV", type=["csv"])
-    if file is not None:
+    if auto_on:
         try:
-            df_in = pd.read_csv(file)
-            required_cols = [c for c in feature_cols if c != "id"]
-            missing = [c for c in feature_cols if c not in df_in.columns]
-            extra = [c for c in df_in.columns if c not in feature_cols]
-            if missing:
-                st.error(f"Missing required columns: {missing}")
-            else:
-                if extra:
-                    st.info(f"Ignoring extra columns: {extra}")
-                X = df_in[feature_cols].copy()
-                if "id" in X.columns:
-                     X["id"] = 0.0
-
-                probs = rf.predict_proba(X)[:, 1]
-                preds = (probs >= threshold).astype(int)
-
-                out = df_in.copy()
-                out["fraud_proba"] = probs
-                out["decision"] = np.where(preds == 1, "REVIEW", "APPROVE")
-
-                st.write("Preview of scored results:")
-                st.dataframe(out.head(20), use_container_width=True)
-
-                st.download_button(
-                    "Download Scored CSV",
-                    data=out.to_csv(index=False),
-                    file_name="scored_transactions.csv",
-                    mime="text/csv",
-                )
+            _ = api_post("/demo/auto_resolve", {"high_fraud": high, "low_legit": low, "max_per_call": int(max_per)})
         except Exception as e:
-            st.error("Failed to score the uploaded file. Check columns and data format.")
-            st.exception(e)
+            st.warning(f"Auto-resolve call failed: {e}")
 
-# =========================================================
-# ========================= CASES =========================
-# =========================================================
-elif selected == "Cases":
-    st.subheader("Cases / Alerts Queue")
+    st.subheader("Refresh")
+    refresh = st.button("Refresh now", use_container_width=True)
+    if refresh:
+        st.rerun()
 
-    # Toggle for demo auto-resolution
-    demo_auto = st.checkbox(
-        "Demo: auto-resolve pending cases (simulate customer responses)",
-        value=True,
-        help="When checked, the app periodically auto-resolves some pending "
-             "cases using a realistic ruleset (for demo only).",
-    )
 
-    cases = sync_cases_from_live()
-    cases = auto_resolve_cases(cases, threshold=threshold, demo_enabled=demo_auto)
+tabs = st.tabs(["Live Feed", "Cases", "Analytics", "Audit Log"])
 
-    if cases.empty:
-        st.info(
-            "No review cases yet. Once transactions are flagged as REVIEW, they will appear here."
-        )
+with tabs[0]:
+    st.subheader("Live Feed (SQLite: live_events)")
+    df = read_live_events(run_id, limit=500)
+    if df.empty:
+        st.info("No live events yet. Start the simulator.")
     else:
-        total_cases = len(cases)
-        cases["status"] = cases["status"].astype(str).str.upper()
-        pending = cases[cases["status"] == "PENDING"]
-        confirmed_fraud = cases[cases["status"] == "CONFIRMED_FRAUD"]
-        confirmed_legit = cases[cases["status"] == "CONFIRMED_LEGIT"]
+        st.dataframe(df.drop(columns=["payload_json"], errors="ignore"), use_container_width=True)
 
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Total cases", total_cases)
-        with c2:
-            st.metric("Pending", len(pending))
-        with c3:
-            st.metric("Confirmed fraud", len(confirmed_fraud))
-        with c4:
-            st.metric("Confirmed legit", len(confirmed_legit))
+with tabs[1]:
+    st.subheader("Cases (SQLite: cases JOIN live_events)")
+    status_filter = st.selectbox("Filter", ["ALL", "PENDING", "CONFIRMED_FRAUD", "CONFIRMED_LEGIT", "DISMISSED"], index=0)
+    status = None if status_filter == "ALL" else status_filter
 
-        st.markdown("### All cases")
-        display_df = cases.copy()
-        if "updated_at" in display_df.columns and display_df["updated_at"].notna().any():
-            display_df = display_df.sort_values(
-                ["updated_at", "event_id"], ascending=[False, False]
-            )
+    cdf = read_cases(run_id, limit=500, status=status)
+    if cdf.empty:
+        st.info("No cases yet (cases are created only when decision=REVIEW).")
+    else:
+        st.dataframe(cdf, use_container_width=True)
+
+    st.markdown("### Resolve a case (FastAPI writes, Streamlit triggers)")
+    colA, colB, colC, colD = st.columns([1.0, 1.2, 1.8, 1.0])
+    event_id = colA.number_input("event_id", min_value=0, value=0, step=1)
+    new_status = colB.selectbox("new_status", ["CONFIRMED_FRAUD", "CONFIRMED_LEGIT", "DISMISSED"])
+    customer_response = colC.text_input("customer_response (optional)", value="")
+    if colD.button("Resolve", use_container_width=True):
+        if event_id <= 0:
+            st.error("Enter a valid event_id")
         else:
-            display_df = display_df.sort_values("event_id", ascending=False)
-
-        if "proba" in display_df.columns:
-            display_df["proba"] = display_df["proba"].apply(
-                lambda v: f"{float(v) * 100:.2f}%" if pd.notna(v) else ""
+            out = api_post(
+                f"/cases/{int(event_id)}/resolve",
+                {
+                    "new_status": new_status,
+                    "customer_response": customer_response or None,
+                    "source": "manual",
+                },
             )
-
-        st.dataframe(display_df, use_container_width=True)
-
-        # Download audit log
-        st.markdown("### Audit log")
-        audit_df = read_audit_log(5000)
-
-        if not audit_df.empty:
-            st.download_button(
-                "Download case audit log (CSV)",
-                data=audit_df.to_csv(index=False),
-                file_name="case_audit_log.csv",
-                mime="text/csv",
-            )
-        else:
-            st.info("Audit log will appear once some cases are auto-resolved.")
-
-# =========================================================
-# =================== SINGLE TRANSACTION ==================
-# =========================================================
-else:  # "Single Transaction"
-    st.subheader("Manually test one transaction")
-    st.caption("Useful for debugging and seeing top contributing factors (SHAP).")
-
-    if st.button("🎲 Prefill from random sample"):
-        if samples is not None and not samples.empty:
-            row = samples.sample(1).iloc[0]
-            set_defaults_from_series(row)
+            st.success(f"Resolved event_id={out['event_id']} → {out['new_status']}")
             st.rerun()
-        else:
-            st.warning(
-                "No demo samples found. Run train_and_export.py to recreate artifacts."
-            )
 
-    cols_to_show = [c for c in feature_cols if c.lower() != "id"]
-    inputs = {}
-    cols = st.columns(3)
-    for i, col in enumerate(cols_to_show):
-        stats = meta[col]
-        m, lo, hi = float(stats["mean"]), float(stats["min"]), float(stats["max"])
-        default_val = get_default_value(col, float(np.clip(m, lo, hi)))
-        with cols[i % 3]:
-            inputs[col] = st.number_input(
-                col,
-                value=default_val,
-                min_value=lo,
-                max_value=hi,
-                step=0.01,
-                format="%.4f",
-            )
-    if "id" in feature_cols:
-        inputs["id"] = get_default_value("id", 0.0)
+with tabs[2]:
+    st.subheader("Analytics (derived from live_events + cases)")
+    snap = analytics_snapshot(run_id)
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Events", snap["events"])
+    a2.metric("Cases", snap["cases"])
+    a3.metric("Pending", snap["pending"])
+    a4.metric("Confirmed Fraud", snap["fraud"])
 
-    if st.button("Score Transaction", type="primary"):
-        x = pd.DataFrame([inputs])[feature_cols]
-        proba = float(rf.predict_proba(x)[:, 1][0])
-        label = int(proba >= threshold)
+    st.caption("All analytics are derived by querying SQLite. No analytics state is written.")
 
-        st.metric(label="Fraud probability", value=f"{proba:.2%}")
-
-        if label == 1:
-            st.markdown(
-                """
-                <div style="background-color:#5a0e0e; padding:15px; border-radius:8px; color:#fff;">
-                    <b>Decision:</b> 🚨 <span style="color:#ff4b4b;">Review (Possible Fraud)</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                """
-                <div style="background-color:#0e5a2b; padding:15px; border-radius:8px; color:#fff;">
-                    <b>Decision:</b> ✅ <span style="color:#9eff9e;">Approved (Legit Transaction)</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        try:
-            shap_vals = shap_for_binary(rf, x)
-            s = pd.Series(shap_vals, index=feature_cols)
-            if "id" in s.index:
-                s = s.drop("id")
-            contrib = s.sort_values(key=np.abs, ascending=False).head(10)
-
-
-            st.write("Top factors influencing this decision:")
-            st.dataframe(
-                pd.DataFrame({"feature": contrib.index, "contribution": contrib.values})
-            )
-
-            fig, ax = plt.subplots()
-            contrib.iloc[::-1].plot(kind="barh", ax=ax)
-            ax.set_title("SHAP contributions (top 10)")
-            ax.set_xlabel("Contribution to fraud risk (±)")
-            ax.grid(True, alpha=0.3)
-            st.pyplot(fig, clear_figure=True)
-
-            st.info(
-                f"Auto-summary: driven primarily by {', '.join(contrib.index[:3])}."
-            )
-        except Exception as e:
-            st.warning("SHAP explanation could not be generated for this input.")
-            st.exception(e)
+with tabs[3]:
+    st.subheader("Audit Log (SQLite: case_audit_log)")
+    adf = read_audit(run_id, limit=500)
+    if adf.empty:
+        st.info("No audit entries yet.")
+    else:
+        st.dataframe(adf, use_container_width=True)
