@@ -7,6 +7,8 @@ SEED_DIR="/seed/artifacts"
 echo "[boot] Starting container..."
 mkdir -p "${ART_DIR}"
 
+# Seed only the ML artifacts needed to run scoring/UI.
+# Never seed app.db and never create CSVs.
 required_files=(
   "feature_cols.json"
   "metadata.json"
@@ -53,6 +55,7 @@ for i in $(seq 1 60); do
   fi
 done
 
+# --- Start simulator automatically ---
 echo "[boot] Starting Simulator (simulator_pro.py)..."
 python -u /app/simulator_pro.py &
 SIM_PID=$!
@@ -70,6 +73,7 @@ term_handler() {
   wait "${SIM_PID}" >/dev/null 2>&1 || true
   wait "${API_PID}" >/dev/null 2>&1 || true
 }
+
 trap term_handler SIGTERM SIGINT
 
 echo "[boot] Container ready. PIDs: uvicorn=${API_PID}, sim=${SIM_PID}, streamlit=${ST_PID}"
@@ -77,4 +81,3 @@ wait -n "${API_PID}" "${SIM_PID}" "${ST_PID}"
 echo "[boot] One process exited; shutting down the others..."
 term_handler
 exit 1
-
