@@ -2,7 +2,7 @@
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 # ---------- Database path ----------
 DB_PATH = Path("artifacts/app.db")
@@ -27,6 +27,25 @@ def get_conn() -> sqlite3.Connection:
 
 
 # ---------- DB initialisation ----------
+def _ensure_live_events_columns(conn: sqlite3.Connection) -> None:
+    """
+    Migration: add new columns to live_events if DB already existed.
+    Safe to run on every startup.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(live_events);").fetchall()}
+
+    if "amount" not in cols:
+        conn.execute("ALTER TABLE live_events ADD COLUMN amount REAL;")
+    if "channel" not in cols:
+        conn.execute("ALTER TABLE live_events ADD COLUMN channel TEXT;")
+    if "country" not in cols:
+        conn.execute("ALTER TABLE live_events ADD COLUMN country TEXT;")
+    if "customer_id" not in cols:
+        conn.execute("ALTER TABLE live_events ADD COLUMN customer_id TEXT;")
+
+    conn.commit()
+
+
 def init_db() -> None:
     """
     Create tables and indexes if they do not exist.
@@ -63,11 +82,18 @@ def init_db() -> None:
               ts           TEXT NOT NULL,
               decision     TEXT NOT NULL CHECK (decision IN ('APPROVE','REVIEW')),
               proba        REAL NOT NULL,
+              amount       REAL,
+              channel      TEXT,
+              country      TEXT,
+              customer_id  TEXT,
               payload_json TEXT NOT NULL,
               FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
             );
             """
         )
+
+        # Migration for existing DBs
+        _ensure_live_events_columns(conn)
 
         # ---- cases (workflow layer on top of live_events) ----
         # event_id is PRIMARY KEY to enforce 1:1 between REVIEW event and case
@@ -123,6 +149,14 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_audit_run_id ON case_audit_log(run_id, id DESC);"
         )
 
+        # New indexes for analytics queries
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_events_run_proba ON live_events(run_id, proba);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_events_run_amount ON live_events(run_id, amount);"
+        )
+
         # Ensure we have an active run_id
         ensure_current_run()
 
@@ -154,13 +188,8 @@ def get_current_run_id() -> int:
 def start_new_run(label: Optional[str] = None, started_at: Optional[str] = None) -> int:
     """
     Start a new run and set it as current_run_id.
-
-    started_at should be an ISO timestamp string (e.g., datetime.utcnow().isoformat()).
-    If not provided, caller should supply it (service.py will).
     """
     if not started_at:
-        # Avoid importing datetime here if you want strict control upstream.
-        # But to make this drop-in, we'll generate a basic ISO timestamp.
         from datetime import datetime, timezone
 
         started_at = datetime.now(timezone.utc).isoformat()
@@ -188,19 +217,36 @@ def insert_live_event(
     decision: str,
     proba: float,
     payload: Dict[str, Any],
+    amount: Optional[float] = None,
+    channel: Optional[str] = None,
+    country: Optional[str] = None,
+    customer_id: Optional[str] = None,
 ) -> int:
     """
     Insert a live event into SQLite atomically.
     Returns generated event_id.
     """
     payload_json = json.dumps(payload, ensure_ascii=False)
+
     with get_conn() as conn:
         cur = conn.execute(
             """
-            INSERT INTO live_events (run_id, ts, decision, proba, payload_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO live_events (
+              run_id, ts, decision, proba, amount, channel, country, customer_id, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (int(run_id), ts, decision, float(proba), payload_json),
+            (
+                int(run_id),
+                ts,
+                decision,
+                float(proba),
+                float(amount) if amount is not None else None,
+                channel,
+                country,
+                customer_id,
+                payload_json,
+            ),
         )
         return int(cur.lastrowid)
 
@@ -236,15 +282,12 @@ def resolve_case(
     Resolve/update a case status and write an audit row in ONE transaction.
     """
     with get_conn() as conn:
-        # Ensure case exists (safety)
         existing = conn.execute(
             "SELECT status FROM cases WHERE event_id=? AND run_id=? LIMIT 1;",
             (int(event_id), int(run_id)),
         ).fetchone()
 
         if not existing:
-            # If a resolve comes in without a case (shouldn't happen),
-            # create a minimal pending case then resolve it.
             conn.execute(
                 """
                 INSERT OR IGNORE INTO cases (
@@ -297,38 +340,6 @@ def resolve_case(
         )
 
 
-def insert_audit_row(row: Dict[str, Any]) -> None:
-    """
-    Backwards-compatible helper (but prefer resolve_case()).
-    """
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO case_audit_log (
-                run_id,
-                event_id,
-                old_status,
-                new_status,
-                source,
-                proba,
-                ts,
-                logged_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                row.get("run_id"),
-                row.get("event_id"),
-                row.get("old_status"),
-                row.get("new_status"),
-                row.get("source"),
-                row.get("proba"),
-                row.get("ts"),
-                row.get("logged_at"),
-            ),
-        )
-
-
 # ---------- Pruning / retention ----------
 def prune_run(run_id: int, max_events: int = 100_000) -> int:
     """
@@ -347,8 +358,6 @@ def prune_run(run_id: int, max_events: int = 100_000) -> int:
 
         to_delete = n - max_events
 
-        # Delete the oldest 'to_delete' events in this run.
-        # Using event_id ordering as insertion order.
         old_ids = conn.execute(
             """
             SELECT event_id
@@ -377,7 +386,6 @@ def prune_run(run_id: int, max_events: int = 100_000) -> int:
 def reset_demo(label: Optional[str] = "demo reset") -> int:
     """
     Soft reset: start a new run_id and make it current.
-    This avoids wiping the DB and eliminates historical confusion in the UI.
     Returns the new run_id.
     """
     return start_new_run(label=label)
@@ -386,7 +394,6 @@ def reset_demo(label: Optional[str] = "demo reset") -> int:
 def hard_reset_all() -> None:
     """
     Hard reset (optional): deletes ALL data.
-    Use only if you truly want a clean DB file state.
     """
     with get_conn() as conn:
         conn.execute("DELETE FROM case_audit_log;")
@@ -398,9 +405,6 @@ def hard_reset_all() -> None:
 
 # ---------- Minimal read helpers (optional convenience) ----------
 def get_run_stats(run_id: int) -> Dict[str, Any]:
-    """
-    Convenience read helper; Streamlit can also run its own SELECTs.
-    """
     with get_conn() as conn:
         ev = conn.execute(
             "SELECT COUNT(*) AS n FROM live_events WHERE run_id=?;", (int(run_id),)

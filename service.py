@@ -105,6 +105,10 @@ def health():
 
 class Tx(BaseModel):
     data: dict  # expects feature names
+    amount: Optional[float] = None
+    channel: Optional[str] = None
+    country: Optional[str] = None
+    customer_id: Optional[str] = None
 
 
 class ResolveCaseIn(BaseModel):
@@ -148,13 +152,26 @@ def score(tx: Tx):
     run_id = get_current_run_id()
     ts = _utc_iso()
 
-    # 1) Always write live event
+    # Store full payload including transaction context for the UI/audit
+    full_payload = {
+        "data": tx.data,
+        "amount": tx.amount,
+        "channel": tx.channel,
+        "country": tx.country,
+        "customer_id": tx.customer_id,
+    }
+
+    # 1) Always write live event WITH structured fields
     event_id = insert_live_event(
         run_id=run_id,
         ts=ts,
         decision=decision,
         proba=proba,
-        payload=tx.data,
+        payload=full_payload,
+        amount=tx.amount,
+        channel=tx.channel,
+        country=tx.country,
+        customer_id=tx.customer_id,
     )
 
     # 2) If REVIEW, create case row referencing the live event
@@ -175,9 +192,6 @@ def score(tx: Tx):
 
 @app.get("/cases")
 def list_cases(status: Optional[str] = None, limit: int = 200):
-    """
-    Convenience endpoint (optional). Streamlit can also read SQLite directly.
-    """
     run_id = get_current_run_id()
     limit = max(1, min(int(limit), 2000))
 
@@ -247,12 +261,6 @@ def resolve_case_endpoint(event_id: int, body: ResolveCaseIn):
 
 @app.post("/demo/auto_resolve")
 def auto_resolve(body: AutoResolveIn):
-    """
-    Demo automation: resolves a subset of PENDING cases based on proba bands.
-    - proba >= high_fraud => CONFIRMED_FRAUD
-    - proba <= low_legit  => CONFIRMED_LEGIT
-    Everything else stays PENDING.
-    """
     run_id = get_current_run_id()
     now = _utc_iso()
 
@@ -303,8 +311,5 @@ def auto_resolve(body: AutoResolveIn):
 
 @app.post("/admin/reset")
 def admin_reset(body: ResetIn):
-    """
-    Soft reset: starts a new run_id. No historical confusion in UI if Streamlit scopes to current run_id.
-    """
     new_run = reset_demo(label=body.label)
     return {"ok": True, "new_run_id": new_run}

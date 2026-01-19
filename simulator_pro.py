@@ -7,6 +7,7 @@ Runs forever by design, but must be log-safe and not spam warnings if the API is
 import json
 import logging
 import os
+import random
 import time
 from pathlib import Path
 
@@ -27,6 +28,10 @@ LOG_INTERVAL = 30
 
 logging.basicConfig(level=logging.INFO, format="[sim] %(message)s")
 log = logging.getLogger("simulator")
+
+# --- realistic context fields for Live Feed ---
+CHANNELS = ["POS", "ECOM", "ATM", "MOTO", "TRANSFER"]
+COUNTRIES = ["GB", "US", "IN", "FR", "DE", "AE"]
 
 
 def load_artifacts():
@@ -55,11 +60,48 @@ def load_artifacts():
     return sim_df, feature_cols, proba_col
 
 
+def _gen_amount_gbp() -> float:
+    """
+    Generate a realistic-ish transaction amount in GBP for demo:
+    log-normal-ish distribution with hard caps.
+    """
+    # random.lognormvariate(mu, sigma) ~ exp(N(mu, sigma^2))
+    # mu=3.5 => median ~ exp(3.5)=33.1
+    # sigma=1.2 gives long tail
+    amt = float(random.lognormvariate(3.5, 1.2))
+    amt = max(1.0, min(amt, 5000.0))
+    return round(amt, 2)
+
+
 def build_payload(row, feature_cols):
     feats = row[feature_cols].to_dict()
     if "id" in feats:
         feats["id"] = 0.0
-    return {"data": feats}
+
+    amount = _gen_amount_gbp()
+
+    channel = random.choices(
+        population=CHANNELS,
+        weights=[0.55, 0.25, 0.10, 0.03, 0.07],
+        k=1,
+    )[0]
+
+    country = random.choices(
+        population=COUNTRIES,
+        weights=[0.70, 0.10, 0.08, 0.05, 0.04, 0.03],
+        k=1,
+    )[0]
+
+    customer_id = f"CUST-{random.randint(100000, 999999)}"
+
+    # Keep features under "data" because service.py expects Tx.data
+    return {
+        "data": feats,
+        "amount": amount,
+        "channel": channel,
+        "country": country,
+        "customer_id": customer_id,
+    }
 
 
 def main():
@@ -96,7 +138,6 @@ def main():
         except Exception as e:
             total_failed += 1
             now = time.time()
-            # Log failure at most once every 15 seconds
             if now - last_fail_log >= 15:
                 log.warning("API not ready (%s). Backing off %.1fs", str(e).splitlines()[0], backoff)
                 last_fail_log = now
